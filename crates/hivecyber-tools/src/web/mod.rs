@@ -1,0 +1,1 @@
+// Tools web (Fase 7) — browser automation para web_pentester

@@ -1,0 +1,27 @@
+[package]
+name = "hivecyber-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "hivecyber"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+hivecyber-core = { path = "../hivecyber-core" }
+hivecyber-providers = { path = "../hivecyber-providers" }
+hivecyber-mcp = { path = "../hivecyber-mcp" }
+hivecyber-skills = { path = "../hivecyber-skills" }
+hivecyber-tools = { path = "../hivecyber-tools" }
+uuid = { workspace = true }
+chrono = { workspace = true }

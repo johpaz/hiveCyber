@@ -1,0 +1,28 @@
+[package]
+name = "hivecyber-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+regex = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+directories = { workspace = true }
+hivecyber-providers = { path = "../hivecyber-providers" }
+hivecyber-tools = { path = "../hivecyber-tools" }
+hivecyber-mcp = { path = "../hivecyber-mcp" }
+hivecyber-skills = { path = "../hivecyber-skills" }
+
+[dev-dependencies]
+uuid = { workspace = true }

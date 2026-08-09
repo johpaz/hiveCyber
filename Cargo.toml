@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hivecyber-core",
+    "crates/hivecyber-cli",
+    "crates/hivecyber-mcp",
+    "crates/hivecyber-skills",
+    "crates/hivecyber-tools",
+    "crates/hivecyber-worker",
+    "crates/hivecyber-providers",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["John Paez"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+regex = "1"
+walkdir = "2"
+directories = "5"
+async-trait = "0.1"
+tokio-tungstenite = "0.24"
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
