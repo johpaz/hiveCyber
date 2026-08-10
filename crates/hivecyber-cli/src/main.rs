@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use hivecyber_core::{Config, HiveDb};
 use hivecyber_core::agent::{catalog, AgentLoop};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -181,6 +182,7 @@ async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Ar
         (*db).clone(),
         config.clone(),
     ).with_security(security.clone()));
+    install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue());
     dispatch.clone().start().await;
 
     let stdin = tokio::io::stdin();
@@ -220,6 +222,7 @@ async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Ar
             thread_id: thread_id.clone(),
             max_iterations: std::cmp::min(max_iter, 10),
             security: security.clone(),
+            queue: Some(dispatch.queue()),
         };
 
         let mut rx = loop_runner.run(opts).await?;
@@ -273,35 +276,270 @@ async fn cmd_run(
     ensure_seed_agents(&db, config).await?;
 
     let thread_id = uuid::Uuid::new_v4().to_string();
-    let loop_runner = AgentLoop::new((*db).clone(), config.clone());
+
+    let dispatch = Arc::new(hivecyber_core::harness::DispatchLoop::new(
+        (*db).clone(),
+        config.clone(),
+    ).with_security(security.clone()));
+    let active = install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue());
+    dispatch.clone().start().await;
 
     let opts = hivecyber_core::agent::loop_runner::AgentLoopOptions {
         agent_id: agent_id.to_string(),
         user_message: prompt.to_string(),
-        thread_id,
+        thread_id: thread_id.clone(),
         max_iterations: 10,
         security: security.clone(),
+        queue: Some(dispatch.queue()),
     };
 
+    *active.lock().await += 1;
+    if let Err(e) = run_agent_and_print(db.clone(), config, opts).await {
+        eprintln!("[error] {}", e);
+    }
+    let mut a = active.lock().await;
+    *a = a.saturating_sub(1);
+    drop(a);
+
+    let mut clean_polls = 0u32;
+    loop {
+        let busy = *active.lock().await > 0 || count_in_flight_jobs(&db).await > 0;
+        if busy {
+            clean_polls = 0;
+        } else {
+            clean_polls += 1;
+            if clean_polls >= 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    }
+
+    dispatch.stop().await;
+    Ok(())
+}
+
+async fn run_agent_and_print(
+    db: Arc<HiveDb>,
+    config: &Config,
+    opts: hivecyber_core::agent::loop_runner::AgentLoopOptions,
+) -> anyhow::Result<()> {
+    let loop_runner = AgentLoop::new((*db).clone(), config.clone());
     let mut rx = loop_runner.run(opts).await?;
 
     while let Some(chunk) = rx.recv().await {
         use hivecyber_core::agent::loop_runner::StreamChunk;
         match chunk {
             StreamChunk::Agent { text } => print!("{}", text),
+            StreamChunk::Reasoning { text } => eprintln!("[reasoning] {}", text),
             StreamChunk::ToolCall { name, args } => eprintln!("\n[tool] {}({})", name, args),
             StreamChunk::ToolResult { name, result } => eprintln!("[result] {} -> {}", name, result),
+            StreamChunk::Usage { input_tokens, output_tokens } => {
+                eprintln!("[usage] in={} out={}", input_tokens, output_tokens);
+            }
             StreamChunk::Done { final_text } => {
                 if !final_text.is_empty() {
                     println!("\n{}", final_text);
                 }
             }
             StreamChunk::Error { message } => eprintln!("[error] {}", message),
-            _ => {}
         }
     }
 
     Ok(())
+}
+
+async fn count_in_flight_jobs(db: &HiveDb) -> usize {
+    let jobs = db.list(hivecyber_core::store::collections::COL_JOBS).await;
+    jobs.into_iter()
+        .filter(|(_, v)| {
+            let s = v.get("status").and_then(|x| x.as_str()).unwrap_or("");
+            s == "pending" || s == "running"
+        })
+        .count()
+}
+
+fn install_terminal_hook(
+    db: Arc<HiveDb>,
+    config: Config,
+    security: Arc<hivecyber_tools::SecurityContext>,
+    queue: Arc<hivecyber_core::harness::DurableQueue>,
+) -> Arc<tokio::sync::Mutex<u32>> {
+    let group_manager = Arc::new(
+        hivecyber_core::harness::delegation_groups::DelegationGroupManager::new((*db).clone()),
+    );
+    let processed: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    let pending_checks: Arc<std::sync::Mutex<u32>> = Arc::new(std::sync::Mutex::new(0));
+    let active = Arc::new(tokio::sync::Mutex::new(0u32));
+
+    let pending_checks_outer = pending_checks.clone();
+    let db_outer = db.clone();
+    let queue_hook = queue.clone();
+    let active_hook = active.clone();
+    queue.register_terminal_hook(Arc::new(move |job_id, result| {
+        *pending_checks_outer.lock().unwrap() += 1;
+        let db = db_outer.clone();
+        let config = config.clone();
+        let security = security.clone();
+        let queue = queue_hook.clone();
+        let group_manager = group_manager.clone();
+        let processed = processed.clone();
+        let pending_checks = pending_checks.clone();
+        let active = active_hook.clone();
+        tokio::spawn(async move {
+            handle_job_completion(
+                db,
+                config,
+                security,
+                queue,
+                group_manager,
+                processed,
+                active,
+                job_id,
+                result,
+            )
+            .await;
+            let mut pc = pending_checks.lock().unwrap();
+            *pc = pc.saturating_sub(1);
+        });
+    }));
+
+    active
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_job_completion(
+    db: Arc<HiveDb>,
+    config: Config,
+    security: Arc<hivecyber_tools::SecurityContext>,
+    queue: Arc<hivecyber_core::harness::DurableQueue>,
+    group_manager: Arc<hivecyber_core::harness::delegation_groups::DelegationGroupManager>,
+    processed: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    active: Arc<tokio::sync::Mutex<u32>>,
+    job_id: String,
+    result: serde_json::Value,
+) {
+    use hivecyber_core::agent::loop_runner::AgentLoopOptions;
+    use hivecyber_core::store::collections::{COL_DELEGATION_GROUPS, COL_JOBS, COL_TASKS};
+
+    let job = db.get(COL_JOBS, &job_id).await;
+    let task_id = job
+        .as_ref()
+        .and_then(|j| j.get("payload_json"))
+        .and_then(|p| p.get("taskId"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
+    let thread_id = job
+        .as_ref()
+        .and_then(|j| j.get("payload_json"))
+        .and_then(|p| p.get("originThreadId"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let Some(task_id) = task_id else {
+        return;
+    };
+
+    let task = db.get(COL_TASKS, &task_id).await;
+    let Some(turn_id) = task
+        .and_then(|t| {
+            t.get("delegation_group_id")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+        })
+    else {
+        return;
+    };
+
+    if group_manager.is_group_complete(&turn_id).await.is_none() {
+        if db.get(COL_DELEGATION_GROUPS, &turn_id).await.is_none() {
+            if let Err(e) = group_manager.create_group(&turn_id, "caelum", &thread_id).await {
+                eprintln!("[sistema] error creando grupo {}: {}", turn_id, e);
+            }
+        }
+        let tasks = db.list(COL_TASKS).await;
+        for (tid, val) in tasks {
+            let grp = val
+                .get("delegation_group_id")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            if grp == turn_id {
+                let _ = group_manager.register_task(&turn_id, &tid).await;
+            }
+        }
+    }
+
+    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status == "completed" || status == "ok" {
+        if let Err(e) = group_manager.record_completion(&turn_id, &task_id).await {
+            eprintln!("[sistema] error registro completado: {}", e);
+        }
+    } else if let Err(e) = group_manager.record_failure(&turn_id, &task_id).await {
+        eprintln!("[sistema] error registro fallo: {}", e);
+    }
+
+    let mut processed_guard = processed.lock().await;
+    if processed_guard.contains(&turn_id) {
+        return;
+    }
+    let complete = group_manager.is_group_complete(&turn_id).await.unwrap_or(false);
+    if !complete {
+        return;
+    }
+    processed_guard.insert(turn_id.clone());
+    drop(processed_guard);
+
+    let deliveries = group_manager.get_group_deliveries(&turn_id).await;
+    let mut msg = String::from(
+        "[Sistema] Los workers delegados completaron sus tareas. Entregas:\n\n",
+    );
+    for (i, (status, delivery)) in deliveries.iter().enumerate() {
+        msg.push_str(&format!("--- Entrega {} (status: {}) ---\n", i + 1, status));
+        if let Some(obj) = delivery.as_object() {
+            if let Some(c) = obj.get("content").and_then(|c| c.as_str()) {
+                msg.push_str(c);
+                msg.push('\n');
+            }
+            if let Some(ev) = obj.get("evidence").and_then(|e| e.as_array()) {
+                for item in ev.iter().take(20) {
+                    if let Some(s) = item.as_str() {
+                        msg.push_str("  [evidencia] ");
+                        msg.push_str(&s.chars().take(600).collect::<String>());
+                        msg.push('\n');
+                    }
+                }
+            }
+        } else {
+            msg.push_str("(sin contenido)\n");
+        }
+    }
+    msg.push_str("\n[Fin de entregas] Responde al operador con un resumen ejecutivo de los hallazgos. Si falta trabajo final (p. ej. compilar un informe), delega a report_writer con task_delegate pasandole el contexto de los hallazgos.");
+
+    eprintln!(
+        "\n[sistema] grupo {} completo — reinyectando entregas a caelum",
+        turn_id
+    );
+
+    *active.lock().await += 1;
+    let active2 = active.clone();
+    let db2 = db.clone();
+    let config2 = config.clone();
+    tokio::spawn(async move {
+        let opts = AgentLoopOptions {
+            agent_id: "caelum".into(),
+            user_message: msg,
+            thread_id,
+            max_iterations: 10,
+            security,
+            queue: Some(queue),
+        };
+        if let Err(e) = run_agent_and_print(db2, &config2, opts).await {
+            eprintln!("[sistema] error en reinyeccion: {}", e);
+        }
+        let mut a = active2.lock().await;
+        *a = a.saturating_sub(1);
+    });
 }
 
 async fn cmd_agent(db: Arc<HiveDb>, action: AgentCommands) -> anyhow::Result<()> {
@@ -459,6 +697,7 @@ async fn cmd_resume(db: Arc<HiveDb>, config: &Config, run_id: &str, security: Ar
         thread_id: thread_id.to_string(),
         max_iterations: 10,
         security: security.clone(),
+        queue: None,
     };
 
     let mut rx = loop_runner.run(opts).await?;

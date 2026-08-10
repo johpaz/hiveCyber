@@ -8,7 +8,13 @@ pub enum Content {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_call_id: String,
+        tool_name: String,
         content: String,
+    },
+    #[serde(rename = "assistant_with_tools")]
+    AssistantWithTools {
+        text: String,
+        tool_calls: Vec<ToolCall>,
     },
 }
 
@@ -75,7 +81,14 @@ impl LlmResponse {
 
     pub fn to_content(&self) -> Content {
         let text = self.content_text().unwrap_or_default();
-        Content::Text(text)
+        if self.tool_calls.is_empty() {
+            Content::Text(text)
+        } else {
+            Content::AssistantWithTools {
+                text,
+                tool_calls: self.tool_calls.clone(),
+            }
+        }
     }
 }
 

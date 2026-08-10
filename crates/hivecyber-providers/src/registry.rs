@@ -35,8 +35,8 @@ impl ProviderRegistry {
             ProviderConfig {
                 id: "gemini".into(),
                 base_url: "https://generativelanguage.googleapis.com".into(),
-                default_model: "gemini-2.0-flash".into(),
-                api_key_env: "GOOGLE_API_KEY".into(),
+                default_model: "gemini-3.6-flash".into(),
+                api_key_env: "GEMINI_API_KEY".into(),
                 custom: true,
             },
             ProviderConfig {
@@ -118,8 +118,8 @@ impl ProviderRegistry {
             },
             ProviderConfig {
                 id: "opencode_go".into(),
-                base_url: "https://api.opencode.ai/v1".into(),
-                default_model: "opencode-go/glm-5.2".into(),
+                base_url: "https://opencode.ai/zen/go".into(),
+                default_model: "kimi-k2.6".into(),
                 api_key_env: "OPENCODE_GO_API_KEY".into(),
                 custom: false,
             },
@@ -204,5 +204,12 @@ impl ProviderRegistry {
         env_map
             .get(provider_id)
             .and_then(|env| std::env::var(env).ok())
+            .or_else(|| {
+                if provider_id == "gemini" {
+                    std::env::var("GOOGLE_API_KEY").ok()
+                } else {
+                    None
+                }
+            })
     }
 }

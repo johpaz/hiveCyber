@@ -36,6 +36,8 @@ impl hivecyber_tools::delegation::TaskDelegateBackend for TaskDelegateBackend {
         )
         .await?;
 
+        self.ensure_group(turn_id, thread_id, &task_id).await?;
+
         let lane = format!("task:{}", task_id);
         let payload = serde_json::json!({
             "workerId": worker_id,
@@ -64,5 +66,38 @@ impl hivecyber_tools::delegation::TaskDelegateBackend for TaskDelegateBackend {
             .await?;
 
         Ok((task_id, job_id))
+    }
+}
+
+impl TaskDelegateBackend {
+    async fn ensure_group(&self, turn_id: &str, thread_id: &str, task_id: &str) -> Result<()> {
+        use crate::store::collections::COL_DELEGATION_GROUPS;
+
+        let existing = self.db.get(COL_DELEGATION_GROUPS, turn_id).await;
+        let mut group = match existing {
+            Some(v) => v,
+            None => serde_json::json!({
+                "turn_id": turn_id,
+                "agent_id": "caelum",
+                "thread_id": thread_id,
+                "task_ids": [],
+                "completed": [],
+                "failed": [],
+            }),
+        };
+
+        if let Some(obj) = group.as_object_mut() {
+            let ids = obj
+                .entry("task_ids".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(arr) = ids.as_array_mut() {
+                if !arr.iter().any(|t| t.as_str() == Some(task_id)) {
+                    arr.push(serde_json::Value::String(task_id.to_string()));
+                }
+            }
+        }
+
+        self.db.insert(COL_DELEGATION_GROUPS, turn_id, group).await?;
+        Ok(())
     }
 }

@@ -179,6 +179,7 @@ impl JobExecutor for WorkerTaskExecutor {
                     role: "tool".into(),
                     content: hivecyber_providers::Content::ToolResult {
                         tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
                         content: result_str,
                     },
                 });
@@ -264,9 +265,10 @@ fn default_model_for(provider: &str) -> &str {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514",
         "openai" => "gpt-4o",
-        "gemini" => "gemini-2.0-flash",
+        "gemini" => "gemini-3.6-flash",
         "ollama" => "llama3.2",
         "groq" => "llama-3.3-70b-versatile",
+        "opencode_go" => "kimi-k2.6",
         _ => "gpt-4o",
     }
 }

@@ -77,6 +77,17 @@ impl LlmProvider for OllamaProvider {
             let content = match &m.content {
                 Content::Text(t) => t.clone(),
                 Content::ToolResult { content, .. } => content.clone(),
+                Content::AssistantWithTools { text, tool_calls } => {
+                    let mut s = text.clone();
+                    for tc in tool_calls {
+                        s.push_str(&format!(
+                            "\n[tool_call: {}({})]",
+                            tc.name,
+                            serde_json::to_string(&tc.arguments).unwrap_or_default()
+                        ));
+                    }
+                    s
+                }
             };
             messages.push(OllamaMessage {
                 role: m.role.clone(),

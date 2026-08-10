@@ -73,7 +73,7 @@ Usan un unico adapter `OpenAiCompatProvider` con `base_url` custom:
 | minimax | https://api.minimax.chat/v1 | abab6.5s-chat | MINIMAX_API_KEY |
 | zai | https://api.z.ai/api/paas/v4 | glm-4-plus | ZAI_API_KEY |
 | modelscope | https://api-inference.modelscope.cn/v1 | Qwen/Qwen2.5-72B-Instruct | MODELSCOPE_API_KEY |
-| opencode_go | https://api.opencode.ai/v1 | opencode-go/glm-5.2 | OPENCODE_GO_API_KEY |
+| opencode_go | https://opencode.ai/zen/go | kimi-k2.6 | OPENCODE_GO_API_KEY |
 | hiveagents | https://api.hiveagents.ai/v1 | hive-max | HIVEAGENTS_API_KEY |
 
 OpenAI-compat request:

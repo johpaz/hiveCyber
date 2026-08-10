@@ -41,6 +41,7 @@ pub struct AgentLoopOptions {
     pub thread_id: String,
     pub max_iterations: u32,
     pub security: Arc<hivecyber_tools::SecurityContext>,
+    pub queue: Option<Arc<crate::harness::DurableQueue>>,
 }
 
 pub struct AgentLoop {
@@ -103,14 +104,25 @@ async fn run_loop(
     let model = agent
         .get("model_id")
         .and_then(|v| v.as_str())
-        .unwrap_or("claude-sonnet-4-20250514");
+        .unwrap_or(match provider {
+            "anthropic" => "claude-sonnet-4-20250514",
+            "gemini" => "gemini-3.6-flash",
+            "openai" => "gpt-4o",
+            "ollama" => "llama3.2",
+            "groq" => "llama-3.3-70b-versatile",
+            "opencode_go" => "kimi-k2.6",
+            _ => "gpt-4o",
+        });
 
     let api_key = match provider {
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
         "openai" => std::env::var("OPENAI_API_KEY").ok(),
-        "gemini" => std::env::var("GOOGLE_API_KEY").ok(),
+        "gemini" => std::env::var("GEMINI_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GOOGLE_API_KEY").ok()),
         "ollama" => std::env::var("OLLAMA_API_KEY").ok().or(Some(String::new())),
         "groq" => std::env::var("GROQ_API_KEY").ok(),
+        "opencode_go" => std::env::var("OPENCODE_GO_API_KEY").ok(),
         _ => std::env::var("ANTHROPIC_API_KEY").ok(),
     }
     .unwrap_or_default();
@@ -125,7 +137,23 @@ async fn run_loop(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let tool_registry = hivecyber_tools::ToolRegistry::create_with_security(opts.security.clone());
+    let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(opts.security.clone());
+
+    let role = agent
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("worker");
+
+    if role == "coordinator" {
+        if let Some(queue) = opts.queue.clone() {
+            let backend = Arc::new(crate::agent::delegation_backend::TaskDelegateBackend {
+                db: db.clone(),
+                queue,
+            });
+            tool_registry.register(Arc::new(hivecyber_tools::delegation::TaskDelegate { db: backend }));
+        }
+    }
+
     let tool_defs: Vec<hivecyber_providers::ToolDef> = tool_registry
         .all()
         .iter()
@@ -235,10 +263,19 @@ async fn run_loop(
             }
         }
 
-        let tool_calls_vec: Vec<(String, serde_json::Value)> = tool_calls
-            .iter()
-            .map(|tc| (tc.name.clone(), tc.arguments.clone()))
-            .collect();
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let mut tool_calls_vec: Vec<(String, serde_json::Value)> = Vec::new();
+        for tc in &tool_calls {
+            let mut args = tc.arguments.clone();
+            if tc.name == "task_delegate" {
+                if let Some(obj) = args.as_object_mut() {
+                    obj.insert("__turn_id".into(), serde_json::json!(turn_id));
+                    obj.insert("__thread_id".into(), serde_json::json!(opts.thread_id));
+                }
+            }
+            tool_calls_vec.push((tc.name.clone(), args));
+        }
 
         let results = crate::tool_runtime::batch::execute_tool_batch(
             tool_calls_vec,
@@ -287,6 +324,7 @@ async fn run_loop(
                 role: "tool".into(),
                 content: Content::ToolResult {
                     tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.name.clone(),
                     content: result_str,
                 },
             });

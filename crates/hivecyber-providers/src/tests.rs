@@ -30,7 +30,7 @@ fn test_anthropic_provider_constructs() {
 
 #[test]
 fn test_gemini_provider_constructs() {
-    let p = crate::gemini::GeminiProvider::new("fake-key", "gemini-2.0-flash");
+    let p = crate::gemini::GeminiProvider::new("fake-key", "gemini-3.6-flash");
     let _ = p;
 }
 
@@ -73,7 +73,7 @@ fn test_registry_get_openai() {
 #[test]
 fn test_registry_get_gemini() {
     let reg = ProviderRegistry::new();
-    let client = reg.get("gemini", "gemini-2.0-flash", "fake-key");
+    let client = reg.get("gemini", "gemini-3.6-flash", "fake-key");
     assert!(client.is_some(), "gemini provider should construct");
 }
 
@@ -157,7 +157,7 @@ fn test_registry_get_modelscope_openai_compat() {
 #[test]
 fn test_registry_get_opencode_go_openai_compat() {
     let reg = ProviderRegistry::new();
-    let client = reg.get("opencode_go", "opencode-go/glm-5.2", "fake-key");
+    let client = reg.get("opencode_go", "kimi-k2.6", "fake-key");
     assert!(client.is_some());
 }
 
@@ -231,6 +231,53 @@ fn test_llm_response_tool_calls_extracted() {
     };
     assert_eq!(resp.tool_calls().len(), 1);
     assert_eq!(resp.tool_calls()[0].name, "nmap");
+}
+
+#[test]
+fn test_to_content_preserves_tool_calls() {
+    let resp = LlmResponse {
+        content: vec![
+            ContentBlock::Text { text: "analizando".into() },
+            ContentBlock::ToolUse {
+                id: "call_2".into(),
+                name: "fs_read".into(),
+                input: serde_json::json!({"path": "src/main.rs"}),
+            },
+        ],
+        tool_calls: vec![ToolCall {
+            id: "call_2".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        }],
+        stop_reason: "tool_use".into(),
+        input_tokens: 10,
+        output_tokens: 5,
+    };
+
+    match resp.to_content() {
+        Content::AssistantWithTools { text, tool_calls } => {
+            assert_eq!(text, "analizando");
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].name, "fs_read");
+            assert_eq!(tool_calls[0].id, "call_2");
+        }
+        other => panic!("expected AssistantWithTools, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_to_content_plain_text_without_tools() {
+    let resp = LlmResponse {
+        content: vec![ContentBlock::Text { text: "listo".into() }],
+        tool_calls: vec![],
+        stop_reason: "end_turn".into(),
+        input_tokens: 1,
+        output_tokens: 1,
+    };
+    match resp.to_content() {
+        Content::Text(t) => assert_eq!(t, "listo"),
+        other => panic!("expected Content::Text, got {:?}", other),
+    }
 }
 
 #[test]

@@ -35,7 +35,12 @@ struct OpenAiRequest {
 #[derive(Serialize)]
 struct OpenAiMessage {
     role: String,
-    content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Serialize)]
@@ -96,23 +101,50 @@ impl LlmProvider for OpenAiCompatProvider {
         if let Some(ref system) = req.system {
             messages.push(OpenAiMessage {
                 role: "system".into(),
-                content: serde_json::json!(system),
+                content: Some(serde_json::json!(system)),
+                tool_call_id: None,
+                tool_calls: None,
             });
         }
 
         for m in &req.messages {
-            let content = match &m.content {
-                Content::Text(t) => serde_json::json!(t),
-                Content::ToolResult { tool_call_id, content } => serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "content": content,
-                }),
+            let (content, tool_call_id, tool_calls) = match &m.content {
+                Content::Text(t) => (Some(serde_json::json!(t)), None, None),
+                Content::ToolResult { tool_call_id, content, .. } => {
+                    (Some(serde_json::json!(content)), Some(tool_call_id.clone()), None)
+                }
+                Content::AssistantWithTools { text, tool_calls } => {
+                    let calls: Vec<serde_json::Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                                }
+                            })
+                        })
+                        .collect();
+                    let content = if text.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::json!(text))
+                    };
+                    (content, None, Some(calls))
+                }
             };
             let role = match m.role.as_str() {
                 "tool" => "tool".to_string(),
                 other => other.to_string(),
             };
-            messages.push(OpenAiMessage { role, content });
+            messages.push(OpenAiMessage {
+                role,
+                content,
+                tool_call_id,
+                tool_calls,
+            });
         }
 
         let tools: Vec<OpenAiTool> = req

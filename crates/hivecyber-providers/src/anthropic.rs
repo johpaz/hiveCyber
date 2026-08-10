@@ -73,11 +73,26 @@ impl LlmProvider for AnthropicProvider {
             .map(|m| {
                 let content = match &m.content {
                     Content::Text(t) => serde_json::json!(t),
-                    Content::ToolResult { tool_call_id, content } => serde_json::json!([{
+                    Content::ToolResult { tool_call_id, content, .. } => serde_json::json!([{
                         "type": "tool_result",
                         "tool_use_id": tool_call_id,
                         "content": content,
                     }]),
+                    Content::AssistantWithTools { text, tool_calls } => {
+                        let mut blocks = vec![serde_json::json!({
+                            "type": "text",
+                            "text": text,
+                        })];
+                        for tc in tool_calls {
+                            blocks.push(serde_json::json!({
+                                "type": "tool_use",
+                                "id": tc.id,
+                                "name": tc.name,
+                                "input": tc.arguments,
+                            }));
+                        }
+                        serde_json::Value::Array(blocks)
+                    }
                 };
                 AnthropicMessage {
                     role: m.role.clone(),
