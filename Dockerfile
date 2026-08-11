@@ -30,6 +30,7 @@ RUN apt-get update \
          whois \
          dnsutils \
          python3 \
+         nftables \
     && for p in yara sqlmap; do \
          apt-get install -y --no-install-recommends "$p" || echo "skip optional: $p"; \
        done \
@@ -37,6 +38,9 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/hivecyber /usr/local/bin/hivecyber
 COPY --from=builder /build/target/release/hivecyber-worker /usr/local/bin/hivecyber-worker
+# Opt-in egress-firewalled entrypoint (run as root + --cap-add=NET_ADMIN). Ver docs/egress.md.
+COPY docker/egress-entrypoint.sh /usr/local/bin/egress-entrypoint.sh
+RUN chmod +x /usr/local/bin/egress-entrypoint.sh
 
 # Run unprivileged; the worker sandbox drops privileges further per exploit tool.
 RUN useradd --create-home --uid 1000 hive

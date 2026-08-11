@@ -1139,3 +1139,64 @@ async fn test_audit_append_is_atomic_under_concurrency() {
     let (ok, errors) = audit::verify_chain(&db).await.unwrap();
     assert!(ok, "chain must stay linear under concurrency; errors: {:?}", errors);
 }
+
+// ---- Acceptance: explicit structured evidence (typed, not regex) ----
+
+#[tokio::test]
+async fn test_acceptance_structured_evidence_items() {
+    use hivecyber_core::agent::acceptance::{parse_evidence, run_acceptance_checks, verdict, CheckStatus, EvidenceItem};
+    use hivecyber_core::store::collections::AcceptanceCriterion;
+
+    // A worker emits explicit typed evidence (JSON), not free text.
+    let evidence = vec![
+        r#"{"type":"tool_run","tool":"nuclei","target":"10.0.0.5"}"#.into(),
+        r#"{"type":"vulnerability","id":"CVE-2023-1234","severity":"high","title":"RCE"}"#.into(),
+    ];
+    let items = parse_evidence(&evidence);
+    assert!(items.iter().any(|i| matches!(i, EvidenceItem::Vulnerability { id, .. } if id.as_deref() == Some("CVE-2023-1234"))));
+
+    let acceptance = vec![AcceptanceCriterion {
+        id: "vuln_findings".into(),
+        description: "findings".into(),
+        check_tool: Some("vuln_findings".into()),
+    }];
+    let checks = run_acceptance_checks("scan", &acceptance, "status: completed", &evidence);
+    assert_eq!(verdict(&checks), CheckStatus::Passed, "typed CVE evidence must pass vuln_findings");
+
+    // Structured exploit proof: an explicit shell session item.
+    let ev2 = vec![r#"{"type":"shell_session","kind":"meterpreter"}"#.into()];
+    let acc2 = vec![AcceptanceCriterion {
+        id: "exploit_proof".into(),
+        description: "proof".into(),
+        check_tool: Some("exploit_proof".into()),
+    }];
+    assert_eq!(
+        verdict(&run_acceptance_checks("x", &acc2, "done", &ev2)),
+        CheckStatus::Passed
+    );
+
+    // Structured intel correlation with 2 cited sources passes without needing
+    // two distinct tool runs.
+    let ev3 = vec![r#"{"type":"correlation","indicator":"1.2.3.4","sources":["shodan","virustotal"]}"#.into()];
+    let acc3 = vec![AcceptanceCriterion {
+        id: "intel_correlation".into(),
+        description: "corr".into(),
+        check_tool: Some("intel_correlation".into()),
+    }];
+    assert_eq!(
+        verdict(&run_acceptance_checks("x", &acc3, "done", &ev3)),
+        CheckStatus::Passed
+    );
+
+    // Insufficient: a vulnerability item with neither id nor severity fails.
+    let ev4 = vec![r#"{"type":"vulnerability","title":"maybe"}"#.into()];
+    let acc4 = vec![AcceptanceCriterion {
+        id: "vuln_findings".into(),
+        description: "findings".into(),
+        check_tool: Some("vuln_findings".into()),
+    }];
+    assert_eq!(
+        verdict(&run_acceptance_checks("x", &acc4, "done", &ev4)),
+        CheckStatus::Failed
+    );
+}

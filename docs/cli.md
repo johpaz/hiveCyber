@@ -31,6 +31,7 @@ Commands:
   runs      Lista runs (para descubrir un run_id que reanudar)
   resume    Retomar run durable interrumpido
   doctor    Verificar dependencias cybersec instaladas
+  egress-rules  Genera firewall nftables (default-deny) desde la EngagementPolicy
   audit     Audit log tamper-evident
   version   Version del binario
   help      Print help
@@ -39,7 +40,10 @@ Options:
   --unsafe-mode               Activa modo inseguro (requerido para exploit)
   --allowlist-hosts <FILE>    Archivo con allowlist de hosts (CIDR o exactos)
   --engagement-policy <FILE>  EngagementPolicy JSON (exclusiones, actividades prohibidas,
-                               aprobacion humana) — si se pasa, prevalece sobre --allowlist-hosts
+                               ventanas horarias, rate_limit_rps, aprobacion humana) —
+                               si se pasa, prevalece sobre --allowlist-hosts
+  --require-policy             Gate obligatorio: rechaza operar sin una EngagementPolicy
+                               valida (recomendado para bug bounty)
   --allow-cli-exec             Habilita la tool cli_exec (desactivada por defecto,
                                requiere ademas --unsafe-mode)
   --approve-human <CATEGORY>   Marca una categoria de EngagementPolicy como aprobada

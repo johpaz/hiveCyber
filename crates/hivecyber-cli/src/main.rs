@@ -21,6 +21,11 @@ struct Cli {
     #[arg(long, global = true)]
     engagement_policy: Option<PathBuf>,
 
+    /// Exige una EngagementPolicy válida para operar (gate obligatorio): sin
+    /// `--engagement-policy` el proceso se rechaza. Recomendado para bug bounty.
+    #[arg(long, global = true)]
+    require_policy: bool,
+
     #[arg(long, global = true)]
     allow_cli_exec: bool,
 
@@ -71,6 +76,19 @@ enum Commands {
         run_id: String,
     },
     Doctor,
+    /// Genera un firewall de egreso nftables (default-deny) desde la
+    /// EngagementPolicy (--engagement-policy). Solo permite los targets + DNS.
+    EgressRules {
+        /// Destinos extra a permitir (IP/CIDR/host): LLM provider, MCP, research.
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+        /// Resolver(es) DNS permitidos (IP). Sin esto, DNS queda abierto (port 53).
+        #[arg(long = "resolver")]
+        resolver: Vec<String>,
+        /// Resolver hostnames de la política/--allow a IPs (DNS en tiempo de generación).
+        #[arg(long)]
+        resolve_hosts: bool,
+    },
     Audit {
         #[command(subcommand)]
         action: AuditCommands,
@@ -202,6 +220,15 @@ async fn main() -> anyhow::Result<()> {
 
     let security = build_security_context(&cli);
 
+    // Mandatory PolicyGate: for bug-bounty operation, refuse to run any network
+    // tooling without a validated EngagementPolicy in place.
+    if cli.require_policy && security.engagement_policy.is_none() {
+        anyhow::bail!(
+            "--require-policy: se requiere una EngagementPolicy válida (--engagement-policy <file>) \
+             antes de operar tools de red. Aborta."
+        );
+    }
+
     match cli.command {
         Commands::Chat { agent } => cmd_chat(db.clone(), &config, &agent, security.clone()).await,
         Commands::Run { prompt, agent } => cmd_run(db.clone(), &config, &agent, &prompt, security.clone()).await,
@@ -215,6 +242,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Runs => cmd_runs(db.clone()).await,
         Commands::Resume { run_id } => cmd_resume(db.clone(), &config, &run_id, security.clone()).await,
         Commands::Doctor => cmd_doctor().await,
+        Commands::EgressRules { allow, resolver, resolve_hosts } => {
+            cmd_egress_rules(security.clone(), allow, resolver, resolve_hosts).await
+        }
         Commands::Audit { action } => cmd_audit(db.clone(), action).await,
         Commands::Version => {
             println!("hivecyber {}", hivecyber_core::VERSION);
@@ -1426,6 +1456,58 @@ async fn cmd_doctor() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn cmd_egress_rules(
+    security: Arc<hivecyber_tools::SecurityContext>,
+    allow: Vec<String>,
+    resolver: Vec<String>,
+    resolve_hosts: bool,
+) -> anyhow::Result<()> {
+    let policy = security
+        .engagement_policy
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("egress-rules requiere --engagement-policy <file>"))?;
+
+    let mut plan = hivecyber_tools::egress::plan_from_policy(policy);
+    for a in &allow {
+        plan.add_destination(a);
+    }
+    for r in &resolver {
+        plan.resolvers.push(r.clone());
+    }
+
+    if resolve_hosts && !plan.unresolved_hosts.is_empty() {
+        let hosts = std::mem::take(&mut plan.unresolved_hosts);
+        for h in hosts {
+            let ips = resolve_host(&h);
+            if ips.is_empty() {
+                plan.unresolved_hosts.push(h); // keep as a warning comment
+            } else {
+                for ip in ips {
+                    plan.add_destination(&ip);
+                }
+            }
+        }
+    }
+
+    print!("{}", hivecyber_tools::egress::nftables_ruleset(&plan));
+    Ok(())
+}
+
+/// Resolve a hostname to its IP strings via the system resolver (blocking; only
+/// used by the offline `egress-rules` command).
+fn resolve_host(host: &str) -> Vec<String> {
+    use std::net::ToSocketAddrs;
+    (host, 0u16)
+        .to_socket_addrs()
+        .map(|addrs| {
+            let mut ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+            ips.sort();
+            ips.dedup();
+            ips
+        })
+        .unwrap_or_default()
 }
 
 /// Cross-platform PATH lookup for an executable (replaces shelling out to

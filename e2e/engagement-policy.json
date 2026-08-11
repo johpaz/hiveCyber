@@ -1,0 +1,10 @@
+{
+  "program": "hivecyber-local-e2e",
+  "targets": [
+    { "host": "127.0.0.1", "paths": ["/**"], "methods": ["GET", "POST"], "rate_limit_rps": 5 },
+    { "host": "localhost", "paths": ["/**"], "methods": ["GET", "POST"], "rate_limit_rps": 5 }
+  ],
+  "excluded": [],
+  "prohibited": ["denial_of_service", "destructive_test", "social_engineering", "physical_testing"],
+  "require_human_approval": ["exploit", "credential_use"]
+}

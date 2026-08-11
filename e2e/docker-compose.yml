@@ -1,0 +1,25 @@
+# Local vulnerable apps for hiveCyber E2E (authorized targets on your own host).
+#
+#   docker compose -f e2e/docker-compose.yml up -d
+#   ./e2e/run-e2e.sh          # drives hiveCyber against them
+#   docker compose -f e2e/docker-compose.yml down
+#
+# All bound to 127.0.0.1 only — never expose these to a network.
+services:
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: hc-juice-shop
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+
+  webgoat:
+    image: webgoat/webgoat:latest
+    container_name: hc-webgoat
+    ports: ["127.0.0.1:8080:8080"]
+    restart: unless-stopped
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: hc-dvwa
+    ports: ["127.0.0.1:8081:80"]
+    restart: unless-stopped

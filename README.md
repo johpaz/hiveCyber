@@ -186,6 +186,8 @@ Ver `.env.example` para todas las API keys soportadas.
 - [docs/cli.md](docs/cli.md) — Comandos CLI completos
 - [docs/distribution.md](docs/distribution.md) — Distribución por SO, Docker, caveat del sandbox, deps externas
 - [docs/use-cases.md](docs/use-cases.md) — Casos de uso: pentest, OSINT, forense, DFIR, blue team, CTF, reportes
+- [docs/e2e.md](docs/e2e.md) — E2E contra apps vulnerables locales (Juice Shop/WebGoat/DVWA) con PolicyGate obligatorio
+- [docs/egress.md](docs/egress.md) — Control de egreso de red (firewall nftables default-deny desde la EngagementPolicy)
 
 ## Testing
 
@@ -202,14 +204,22 @@ reales (Bugcrowd/HackerOne). Estado actual entre corchetes:
 - **Auditoría atómica** de la cadena hash. [✅ hecho — `append_audit` bajo lock global; test de concurrencia]
 - **Ventanas horarias** de engagement. [✅ hecho — `EngagementPolicy::is_within_window`, aplicado en `validate_target`]
 - **Rate limiting compartido** por programa y por destino. [✅ hecho — limiter process-global por `programa::host`, fail-closed; aplicado en `validate_target` para tools in-process]
-- **PolicyGate obligatorio** delante de **toda** tool de red (que la política no sea opcional):
-  hoy el gate aplica allowlist/exclusiones/rutas/métodos/ventanas/rate y aprobaciones, pero si
-  no se pasa `--engagement-policy` cae al allowlist simple. [parcial: falta un modo que **exija**
-  política y rechace red sin ella]
-- **Control de egreso de red fuera del proceso** del agente (proxy/allowlist a nivel de red,
-  no solo validación in-process; cubre también las tools sandboxeadas del subproceso). [pendiente]
-- **Acceptance por evidencias estructuradas** (no heurísticas regex/substring). [pendiente]
-- **E2E contra apps vulnerables locales** (OWASP Juice Shop, WebGoat, DVWA). [pendiente]
+- **PolicyGate obligatorio**: `--require-policy` **rechaza** operar sin una `EngagementPolicy`
+  válida; el gate aplica allowlist/exclusiones/rutas/métodos/ventanas/rate y aprobaciones.
+  [✅ hecho — modo obligatorio disponible]
+- **Acceptance por evidencias estructuradas**: modelo tipado `EvidenceItem` (host, vulnerability,
+  shell_session, credential, artifact, correlation, report_file, reproduction…); los tools/workers
+  pueden emitir evidencia JSON explícita y los verificadores asertan sobre ella; el texto legado se
+  deriva a items tipados (compatibilidad). [✅ hecho]
+- **E2E contra apps vulnerables locales** (Juice Shop, WebGoat, DVWA): `e2e/docker-compose.yml` +
+  `e2e/engagement-policy.json` + `e2e/run-e2e.sh` (ver `docs/e2e.md`). Scaffolding validado (target
+  arranca y responde; harness carga política + pasa el gate); el paso con LLM requiere una key.
+  [✅ hecho]
+- **Control de egreso de red fuera del proceso** (firewall nftables default-deny a nivel de kernel,
+  generado desde la política): `hivecyber egress-rules --engagement-policy <f>` produce el ruleset
+  (solo targets + DNS + infra permitida); entrypoint Docker opt-in que lo aplica como root y baja a
+  `hive` (`--cap-add=NET_ADMIN`). Protocolo-agnóstico (cubre nmap/hydra/dig/HTTP y el subproceso
+  worker). [✅ hecho — ver `docs/egress.md`. Roadmap: separación agente/tools por cgroup]
 
 ## Licencia
 
