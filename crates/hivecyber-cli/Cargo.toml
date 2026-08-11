@@ -25,3 +25,4 @@ hivecyber-skills = { path = "../hivecyber-skills" }
 hivecyber-tools = { path = "../hivecyber-tools" }
 uuid = { workspace = true }
 chrono = { workspace = true }
+serde_yaml = { workspace = true }

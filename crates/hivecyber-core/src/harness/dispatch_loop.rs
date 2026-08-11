@@ -14,30 +14,49 @@ pub struct DispatchLoop {
     queue: Arc<DurableQueue>,
     executors: HashMap<String, Arc<dyn JobExecutor>>,
     running: Arc<Mutex<bool>>,
+    security: Arc<hivecyber_tools::SecurityContext>,
+    mcp: Option<crate::agent::mcp_integration::SharedMcp>,
 }
 
 impl DispatchLoop {
     pub fn new(db: HiveDb, config: Config) -> Self {
         let queue = Arc::new(DurableQueue::new(db.clone()));
-        let worker_exec = Arc::new(WorkerTaskExecutor::new(db.clone(), config.clone()));
+        let security = Arc::new(hivecyber_tools::SecurityContext::default());
 
-        let mut executors: HashMap<String, Arc<dyn JobExecutor>> = HashMap::new();
-        executors.insert("worker_task".to_string(), worker_exec);
-
-        DispatchLoop {
+        let mut loop_ = DispatchLoop {
             db,
             config,
             queue,
-            executors,
+            executors: HashMap::new(),
             running: Arc::new(Mutex::new(false)),
-        }
+            security,
+            mcp: None,
+        };
+        loop_.rebuild_worker_executor();
+        loop_
+    }
+
+    /// Rebuild the `worker_task` executor from the current security + MCP so the
+    /// builder setters compose (order-independent) instead of overwriting each
+    /// other's configuration.
+    fn rebuild_worker_executor(&mut self) {
+        let worker_exec = Arc::new(
+            WorkerTaskExecutor::new(self.db.clone(), self.config.clone())
+                .with_security(self.security.clone())
+                .with_mcp(self.mcp.clone()),
+        );
+        self.executors.insert("worker_task".to_string(), worker_exec);
     }
 
     pub fn with_security(mut self, security: Arc<hivecyber_tools::SecurityContext>) -> Self {
-        let worker_exec = Arc::new(
-            WorkerTaskExecutor::new(self.db.clone(), self.config.clone()).with_security(security),
-        );
-        self.executors.insert("worker_task".to_string(), worker_exec);
+        self.security = security;
+        self.rebuild_worker_executor();
+        self
+    }
+
+    pub fn with_mcp(mut self, mcp: Option<crate::agent::mcp_integration::SharedMcp>) -> Self {
+        self.mcp = mcp;
+        self.rebuild_worker_executor();
         self
     }
 

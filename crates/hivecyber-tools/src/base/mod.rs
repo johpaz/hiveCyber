@@ -279,6 +279,103 @@ impl Tool for FsExists {
     }
 }
 
+pub struct FsList;
+
+#[async_trait]
+impl Tool for FsList {
+    fn name(&self) -> &str { "fs_list" }
+    fn description(&self) -> &str { "Lista las entradas de un directorio (nombre, tipo, tamaño)." }
+    fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn parameters(&self) -> ToolSchema {
+        let mut props = HashMap::new();
+        props.insert("path".into(), json!({"type": "string", "default": "."}));
+        ToolSchema {
+            schema_type: "object".into(),
+            properties: props,
+            required: None,
+        }
+    }
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let p = read_params(&params)?;
+        let path = get_str(&p, "path", ".");
+
+        let mut rd = tokio::fs::read_dir(&path)
+            .await
+            .with_context(|| format!("read_dir {}", path))?;
+        let mut entries = Vec::new();
+        while let Some(entry) = rd.next_entry().await? {
+            let meta = entry.metadata().await.ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            entries.push(json!({
+                "name": entry.file_name().to_string_lossy(),
+                "is_dir": is_dir,
+                "size": size,
+            }));
+        }
+        entries.sort_by(|a, b| {
+            a.get("name").and_then(|v| v.as_str()).unwrap_or("")
+                .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+        });
+
+        Ok(json!({"path": path, "count": entries.len(), "entries": entries}))
+    }
+}
+
+pub struct FsDelete;
+
+#[async_trait]
+impl Tool for FsDelete {
+    fn name(&self) -> &str { "fs_delete" }
+    fn description(&self) -> &str { "Elimina un archivo o directorio. Con recursive=true borra directorios no vacíos." }
+    fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn parameters(&self) -> ToolSchema {
+        let mut props = HashMap::new();
+        props.insert("path".into(), json!({"type": "string"}));
+        props.insert("recursive".into(), json!({"type": "boolean", "default": false}));
+        ToolSchema {
+            schema_type: "object".into(),
+            properties: props,
+            required: Some(vec!["path".into()]),
+        }
+    }
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let p = read_params(&params)?;
+        let path = p.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("path required"))?;
+        let recursive = p.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Refuse obviously catastrophic targets outright. This is a coarse guard,
+        // not a full sandbox — the real confinement for sandboxed workers is the
+        // seccomp/rlimit layer; here we just stop trivially fatal mistakes.
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty()
+            || matches!(trimmed, "/" | "/bin" | "/etc" | "/usr" | "/var" | "/boot" | "/lib" | "/sys" | "/proc" | "/dev")
+            || path == std::env::var("HOME").unwrap_or_default()
+        {
+            return Ok(json!({
+                "error": "refused",
+                "message": format!("refusing to delete protected path '{}'", path),
+            }));
+        }
+
+        let meta = tokio::fs::symlink_metadata(path)
+            .await
+            .with_context(|| format!("stat {}", path))?;
+
+        if meta.is_dir() {
+            if recursive {
+                tokio::fs::remove_dir_all(path).await.with_context(|| format!("remove_dir_all {}", path))?;
+            } else {
+                tokio::fs::remove_dir(path).await.with_context(|| format!("remove_dir {} (use recursive=true for non-empty)", path))?;
+            }
+        } else {
+            tokio::fs::remove_file(path).await.with_context(|| format!("remove_file {}", path))?;
+        }
+
+        Ok(json!({"path": path, "deleted": true, "was_dir": meta.is_dir()}))
+    }
+}
+
 pub struct WebFetch;
 
 #[async_trait]
@@ -346,6 +443,149 @@ fn strip_html(html: &str) -> String {
     result.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+pub struct WebSearch;
+
+#[async_trait]
+impl Tool for WebSearch {
+    fn name(&self) -> &str { "web_search" }
+    fn description(&self) -> &str {
+        "Busca en la web y retorna los resultados (título, url, snippet). OSINT/reconocimiento pasivo."
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn parameters(&self) -> ToolSchema {
+        let mut props = HashMap::new();
+        props.insert("query".into(), json!({"type": "string", "description": "Términos de búsqueda"}));
+        props.insert("max_results".into(), json!({"type": "integer", "default": 10}));
+        ToolSchema {
+            schema_type: "object".into(),
+            properties: props,
+            required: Some(vec!["query".into()]),
+        }
+    }
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let p = read_params(&params)?;
+        let query = p.get("query").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("query required"))?;
+        let max_results = get_u64(&p, "max_results", 10) as usize;
+
+        // DuckDuckGo HTML endpoint: no API key, scrape-friendly. Same shape as
+        // Hive's web-search.ts (browser User-Agent, HTML result parse).
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .build()?;
+
+        let resp = client
+            .post("https://html.duckduckgo.com/html/")
+            .form(&[("q", query)])
+            .send()
+            .await?;
+        let status = resp.status();
+        let html = resp.text().await?;
+
+        let results = parse_ddg_results(&html, max_results);
+
+        Ok(json!({
+            "query": query,
+            "status": status.as_u16(),
+            "count": results.len(),
+            "results": results,
+        }))
+    }
+}
+
+/// Best-effort parse of DuckDuckGo HTML result blocks. Each result exposes an
+/// anchor `class="result__a" href="..."` (title) and a `class="result__snippet"`
+/// block. String-scan rather than a full HTML parser to avoid a heavy dep — if
+/// DDG changes markup this degrades to fewer/zero results rather than panicking.
+fn parse_ddg_results(html: &str, max_results: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    for chunk in html.split("result__a").skip(1) {
+        if out.len() >= max_results {
+            break;
+        }
+        let href = extract_attr(chunk, "href=\"");
+        let title = extract_between(chunk, ">", "</a>").map(|t| strip_html(&t));
+        // The snippet lives shortly after the title anchor in the same block.
+        let snippet = chunk
+            .split_once("result__snippet")
+            .and_then(|(_, rest)| extract_between(rest, ">", "</a>"))
+            .map(|s| strip_html(&s));
+        if let (Some(href), Some(title)) = (href, title) {
+            let url = decode_ddg_redirect(&href);
+            if title.trim().is_empty() {
+                continue;
+            }
+            out.push(json!({
+                "title": title.trim(),
+                "url": url,
+                "snippet": snippet.unwrap_or_default().trim(),
+            }));
+        }
+    }
+    out
+}
+
+fn extract_attr(s: &str, prefix: &str) -> Option<String> {
+    let start = s.find(prefix)? + prefix.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn extract_between(s: &str, open: &str, close: &str) -> Option<String> {
+    let start = s.find(open)? + open.len();
+    let rest = &s[start..];
+    let end = rest.find(close)?;
+    Some(rest[..end].to_string())
+}
+
+/// DDG wraps result links as `//duckduckgo.com/l/?uddg=<url-encoded target>`.
+/// Recover the real target when present; otherwise return the href as-is.
+fn decode_ddg_redirect(href: &str) -> String {
+    if let Some(idx) = href.find("uddg=") {
+        let enc = &href[idx + 5..];
+        let enc = enc.split('&').next().unwrap_or(enc);
+        return percent_decode(enc);
+    }
+    if let Some(stripped) = href.strip_prefix("//") {
+        return format!("https://{}", stripped);
+    }
+    href.to_string()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 pub struct CliExec {
     security: Arc<crate::registry::SecurityContext>,
 }
@@ -379,9 +619,27 @@ impl Tool for CliExec {
         let cwd = get_str(&p, "cwd", ".");
         let timeout_secs = get_u64(&p, "timeout_seconds", 30);
 
+        // cli_exec is disabled by default. It must be explicitly enabled via
+        // --allow-cli-exec on the CLI; that flag also implies --unsafe-mode +
+        // an allowlist/engagement policy. Freeform shell execution is the
+        // narrowest hole for scope bypass — keep it opt-in.
+        if !self.security.allow_cli_exec {
+            return Err(anyhow!(
+                "cli_exec disabled by default — enable with --allow-cli-exec (requires --unsafe-mode and allowlist/engagement policy)"
+            ));
+        }
+        if !self.security.unsafe_mode {
+            return Err(anyhow!(
+                "cli_exec requires --unsafe-mode (security.unsafe_default=false)"
+            ));
+        }
+
         let denylist = [
             "rm -rf /", "sudo", "chmod 777", "> /dev/", "mkfs",
             "dd if=/dev/zero", ":(){ :|:& };:",
+            "curl ", "wget ",
+            "python", "python3", "node ", "perl ", "ruby ",
+            "nc ", "ncat ", "bash -i", "/dev/tcp/",
         ];
         for blocked in &denylist {
             if command.contains(blocked) {
@@ -391,17 +649,44 @@ impl Tool for CliExec {
 
         let cmd_lower = command.to_lowercase();
         let is_dangerous = DANGEROUS_COMMANDS.iter().any(|d| cmd_lower.contains(d));
-        if is_dangerous && !self.security.unsafe_mode {
-            return Err(anyhow!(
-                "dangerous command '{}' requires --unsafe flag (security.unsafe_default=false)",
-                command
-            ));
+        if is_dangerous {
+            if self.security.allowlist_hosts.is_empty()
+                && self
+                    .security
+                    .engagement_policy
+                    .as_ref()
+                    .map(|p| p.targets.is_empty())
+                    .unwrap_or(true)
+            {
+                return Err(anyhow!(
+                    "dangerous command '{}' requires --allowlist-hosts (no allowlist configured)",
+                    command
+                ));
+            }
         }
-        if is_dangerous && self.security.allowlist_hosts.is_empty() {
-            return Err(anyhow!(
-                "dangerous command '{}' requires --allowlist-hosts (allowlist empty)",
-                command
-            ));
+
+        // Validate every argv token that looks like a host/IP against the scope.
+        // This is a best-effort complement to the tool-level `target` validation:
+        // it covers `nmap`, `hydra`-style invocations where the target is a
+        // positional argument rather than a structured parameter.
+        for tok in command.split_whitespace() {
+            let candidate = tok.trim_matches(|c: char| c.is_ascii_punctuation());
+            if candidate.is_empty() {
+                continue;
+            }
+            if candidate.contains('.')
+                || candidate.parse::<std::net::IpAddr>().is_ok()
+                || crate::engagement::normalize_host(candidate).parse::<std::net::IpAddr>().is_ok()
+            {
+                if !candidate.contains('/')
+                    && self.security.validate_target(candidate).is_err()
+                {
+                    return Err(anyhow!(
+                        "token '{}' looks like a host/IP but is not in scope",
+                        candidate
+                    ));
+                }
+            }
         }
 
         let mut cmd = tokio::process::Command::new("bash");
@@ -440,5 +725,58 @@ impl Tool for CliExec {
             "stdout": truncated_out,
             "stderr": truncated_err,
         }))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ddg_parse_extracts_title_url_snippet() {
+        // Minimal fixture mimicking DuckDuckGo HTML result markup.
+        let html = r#"
+        <div class="result">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&rut=x">Example <b>Title</b> One</a>
+          <a class="result__snippet" href="/l">A short snippet about the first result.</a>
+        </div>
+        <div class="result">
+          <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fb">Second Result</a>
+          <a class="result__snippet" href="/l">Second snippet.</a>
+        </div>
+        "#;
+        let results = parse_ddg_results(html, 10);
+        assert_eq!(results.len(), 2, "should parse both result blocks");
+        assert_eq!(results[0]["title"], "Example Title One");
+        assert_eq!(results[0]["url"], "https://example.com/a");
+        assert_eq!(results[0]["snippet"], "A short snippet about the first result.");
+        assert_eq!(results[1]["url"], "https://example.org/b");
+    }
+
+    #[test]
+    fn ddg_parse_respects_max_results() {
+        let mut html = String::new();
+        for i in 0..5 {
+            html.push_str(&format!(
+                r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fx{}.com">T{}</a>"#,
+                i, i
+            ));
+        }
+        assert_eq!(parse_ddg_results(&html, 3).len(), 3);
+    }
+
+    #[test]
+    fn percent_decode_handles_encoded_and_plus() {
+        assert_eq!(percent_decode("a%20b+c"), "a b c");
+        assert_eq!(percent_decode("https%3A%2F%2Fx.com"), "https://x.com");
+    }
+
+    #[test]
+    fn decode_ddg_redirect_recovers_target_and_protocol_relative() {
+        assert_eq!(
+            decode_ddg_redirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.com%2Fy&rut=z"),
+            "https://x.com/y"
+        );
+        assert_eq!(decode_ddg_redirect("//example.com/path"), "https://example.com/path");
+        assert_eq!(decode_ddg_redirect("https://direct.com"), "https://direct.com");
     }
 }

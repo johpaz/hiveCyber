@@ -11,7 +11,7 @@ fn test_registry_lists_all_16_providers() {
         "anthropic", "openai", "gemini", "ollama",
         "groq", "mistral", "openrouter", "deepseek",
         "kimi", "nvidia", "qwen", "minimax",
-        "zai", "modelscope", "opencode_go", "hiveagents",
+        "z-ai", "modelscope", "opencode-go", "hiveagents",
     ];
     for id in &expected {
         assert!(
@@ -143,7 +143,7 @@ fn test_registry_get_minimax_openai_compat() {
 #[test]
 fn test_registry_get_zai_openai_compat() {
     let reg = ProviderRegistry::new();
-    let client = reg.get("zai", "glm-4-plus", "fake-key");
+    let client = reg.get("z-ai", "glm-4-plus", "fake-key");
     assert!(client.is_some());
 }
 
@@ -157,7 +157,7 @@ fn test_registry_get_modelscope_openai_compat() {
 #[test]
 fn test_registry_get_opencode_go_openai_compat() {
     let reg = ProviderRegistry::new();
-    let client = reg.get("opencode_go", "kimi-k2.6", "fake-key");
+    let client = reg.get("opencode-go", "kimi-k2.6", "fake-key");
     assert!(client.is_some());
 }
 

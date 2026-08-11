@@ -57,9 +57,25 @@ struct StdioConnection {
     stdout: Arc<Mutex<BufReader<ChildStdout>>>,
 }
 
+/// Streamable-HTTP / SSE transport. Each JSON-RPC message is POSTed to the
+/// server URL; the response arrives either as `application/json` or as a
+/// `text/event-stream` `data:` frame. The `Mcp-Session-Id` returned on
+/// `initialize` is echoed on every subsequent request.
+struct HttpConnection {
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Mutex<Option<String>>,
+}
+
+enum Transport {
+    Stdio(Arc<Mutex<StdioConnection>>),
+    Http(Arc<HttpConnection>),
+}
+
 pub struct McpClientManager {
     servers: HashMap<String, McpServerState>,
-    conns: HashMap<String, Arc<Mutex<StdioConnection>>>,
+    conns: HashMap<String, Transport>,
     req_id: Arc<Mutex<u64>>,
 }
 
@@ -93,41 +109,63 @@ impl McpClientManager {
             .config
             .clone();
 
-        if config.transport != "stdio" {
-            if let Some(state) = self.servers.get_mut(name) {
-                state.status = "connected".into();
+        match config.transport.as_str() {
+            "stdio" => {
+                let command = config
+                    .command
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("stdio transport requires command"))?;
+                let args = config.args.clone().unwrap_or_default();
+
+                let mut env: HashMap<String, String> = std::env::vars().collect();
+                for (k, v) in &config.env {
+                    env.insert(k.clone(), v.clone());
+                }
+
+                info!("MCP server '{}' connecting via stdio: {} {:?}", name, command, args);
+
+                let mut cmd = Command::new(&command);
+                cmd.args(&args);
+                cmd.envs(&env);
+                cmd.stdin(Stdio::piped());
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::null());
+
+                let mut child = cmd.spawn().with_context(|| format!("spawn {}", command))?;
+                let stdin = child.stdin.take().context("no stdin")?;
+                let stdout = child.stdout.take().context("no stdout")?;
+                let reader = Arc::new(Mutex::new(BufReader::new(stdout)));
+
+                let conn = StdioConnection { child, stdin, stdout: reader };
+                self.conns
+                    .insert(name.to_string(), Transport::Stdio(Arc::new(Mutex::new(conn))));
             }
-            info!("MCP server '{}' ({} transport) stubbed", name, config.transport);
-            return Ok(());
+            "sse" | "http" | "streamable-http" => {
+                let url = config
+                    .url
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("sse transport requires url"))?;
+                info!("MCP server '{}' connecting via SSE/http: {}", name, url);
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()?;
+                let conn = HttpConnection {
+                    client,
+                    url,
+                    headers: config.headers.clone(),
+                    session_id: Mutex::new(None),
+                };
+                self.conns
+                    .insert(name.to_string(), Transport::Http(Arc::new(conn)));
+            }
+            other => {
+                if let Some(state) = self.servers.get_mut(name) {
+                    state.status = "error".into();
+                    state.last_error = Some(format!("unsupported transport: {}", other));
+                }
+                return Err(anyhow::anyhow!("unsupported MCP transport: {}", other));
+            }
         }
-
-        let command = config
-            .command
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("stdio transport requires command"))?;
-        let args = config.args.clone().unwrap_or_default();
-
-        let mut env: HashMap<String, String> = std::env::vars().collect();
-        for (k, v) in &config.env {
-            env.insert(k.clone(), v.clone());
-        }
-
-        info!("MCP server '{}' connecting via stdio: {} {:?}", name, command, args);
-
-        let mut cmd = Command::new(&command);
-        cmd.args(&args);
-        cmd.envs(&env);
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
-
-        let mut child = cmd.spawn().with_context(|| format!("spawn {}", command))?;
-        let stdin = child.stdin.take().context("no stdin")?;
-        let stdout = child.stdout.take().context("no stdout")?;
-        let reader = Arc::new(Mutex::new(BufReader::new(stdout)));
-
-        let conn = StdioConnection { child, stdin, stdout: reader };
-        self.conns.insert(name.to_string(), Arc::new(Mutex::new(conn)));
 
         if let Some(state) = self.servers.get_mut(name) {
             state.status = "connecting".into();
@@ -205,9 +243,12 @@ impl McpClientManager {
     }
 
     pub async fn disconnect_server(&mut self, name: &str) -> Result<()> {
-        if let Some(conn) = self.conns.remove(name) {
-            let mut c = conn.lock().await;
-            let _ = c.child.kill().await;
+        if let Some(transport) = self.conns.remove(name) {
+            // Only stdio owns a child process to reap; HTTP is stateless per request.
+            if let Transport::Stdio(conn) = transport {
+                let mut c = conn.lock().await;
+                let _ = c.child.kill().await;
+            }
         }
         if let Some(state) = self.servers.get_mut(name) {
             state.status = "disconnected".into();
@@ -255,33 +296,46 @@ impl McpClientManager {
     }
 
     async fn send_jsonrpc(&self, server: &str, req: &serde_json::Value) -> Result<serde_json::Value> {
-        let conn = self
+        let transport = self
             .conns
             .get(server)
-            .ok_or_else(|| anyhow::anyhow!("server not connected: {}", server))?
-            .clone();
+            .ok_or_else(|| anyhow::anyhow!("server not connected: {}", server))?;
 
-        let mut c = conn.lock().await;
-        let json = serde_json::to_string(req)?;
-        c.stdin.write_all(format!("{}\n", json).as_bytes()).await?;
-        c.stdin.flush().await?;
+        match transport {
+            Transport::Stdio(conn) => {
+                let conn = conn.clone();
+                let mut c = conn.lock().await;
+                let json = serde_json::to_string(req)?;
+                c.stdin.write_all(format!("{}\n", json).as_bytes()).await?;
+                c.stdin.flush().await?;
 
-        let mut reader = c.stdout.lock().await;
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        drop(reader);
-        drop(c);
+                let reader = c.stdout.clone();
+                drop(c);
+                let mut reader = reader.lock().await;
+                let mut line = String::new();
+                reader.read_line(&mut line).await?;
 
-        serde_json::from_str(&line)
-            .with_context(|| format!("parse mcp resp: {}", line.chars().take(200).collect::<String>()))
+                serde_json::from_str(&line).with_context(|| {
+                    format!("parse mcp resp: {}", line.chars().take(200).collect::<String>())
+                })
+            }
+            Transport::Http(conn) => http_send(conn, req).await,
+        }
     }
 
     async fn send_jsonrpc_notification(&self, server: &str, req: &serde_json::Value) -> Result<()> {
-        if let Some(conn) = self.conns.get(server) {
-            let mut c = conn.lock().await;
-            let json = serde_json::to_string(req)?;
-            c.stdin.write_all(format!("{}\n", json).as_bytes()).await?;
-            c.stdin.flush().await?;
+        match self.conns.get(server) {
+            Some(Transport::Stdio(conn)) => {
+                let mut c = conn.lock().await;
+                let json = serde_json::to_string(req)?;
+                c.stdin.write_all(format!("{}\n", json).as_bytes()).await?;
+                c.stdin.flush().await?;
+            }
+            Some(Transport::Http(conn)) => {
+                // Notifications carry no id; a 202/empty body is expected.
+                let _ = http_send(conn, req).await;
+            }
+            None => {}
         }
         Ok(())
     }
@@ -299,4 +353,67 @@ impl Default for McpClientManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// POST one JSON-RPC message over the streamable-HTTP transport and return the
+/// parsed response. Captures the `Mcp-Session-Id` header from the first reply
+/// and echoes it on later requests; accepts both `application/json` bodies and
+/// `text/event-stream` frames (the response rides the first `data:` line).
+async fn http_send(conn: &HttpConnection, req: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut builder = conn
+        .client
+        .post(&conn.url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+
+    for (k, v) in &conn.headers {
+        builder = builder.header(k, v);
+    }
+    if let Some(sid) = conn.session_id.lock().await.clone() {
+        builder = builder.header("Mcp-Session-Id", sid);
+    }
+
+    let resp = builder.json(req).send().await.context("mcp http POST")?;
+    let status = resp.status();
+
+    // Persist a session id handed back by the server (usually on initialize).
+    if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        *conn.session_id.lock().await = Some(sid.to_string());
+    }
+
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp.text().await.unwrap_or_default();
+
+    // A notification (no id) may come back 202 with an empty body.
+    if body.trim().is_empty() {
+        if status.is_success() {
+            return Ok(serde_json::Value::Null);
+        }
+        return Err(anyhow::anyhow!("mcp http {}: empty body", status));
+    }
+
+    if ctype.contains("text/event-stream") {
+        // Return the JSON payload of the first `data:` line that parses.
+        for line in body.lines() {
+            let line = line.trim();
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    return Ok(v);
+                }
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "mcp sse: no data frame parsed ({})",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+
+    serde_json::from_str(&body)
+        .with_context(|| format!("parse mcp http resp: {}", body.chars().take(200).collect::<String>()))
 }

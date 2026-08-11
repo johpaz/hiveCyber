@@ -2,18 +2,31 @@
 
 ## Resumen
 
-hiveCyber implementa MCP nativamente en Rust, sin depender del crate `rmcp`. El protocolo es JSON-RPC 2.0 sobre stdio. Soporte SSE/WebSocket declarado pero stubbeado en MVP.
+hiveCyber implementa MCP nativamente en Rust, sin depender del crate `rmcp`. El
+protocolo es JSON-RPC 2.0 con dos transportes: **stdio** (proceso hijo) y
+**streamable-HTTP / SSE** (`reqwest`, con eco de `Mcp-Session-Id`). Los servers se
+persisten en la colección `mcp_servers`, se conectan en el arranque de
+`chat`/`run`, y cada tool descubierta se expone al agente como una tool normal
+(`McpToolProxy`) que fluye por el tool-selector BM25. WebSocket queda como
+Roadmap.
 
 ## Arquitectura
 
 ```
 crates/hivecyber-mcp/src/lib.rs
-├── McpServerConfig     (config de un server: transport, command, args, env, url, headers)
-├── McpConfig            ({ servers: HashMap<name, McpServerConfig> })
-├── McpTool              ({ name, description, parameters, server_name })
-├── McpServerState       ({ name, config, status, tools, last_error })
-├── StdioConnection      (child: tokio::process::Child, stdin, stdout: Arc<Mutex<BufReader>>)
-└── McpClientManager     (servers + conns + req_id)
+├── McpServerConfig     (transport, command, args, env, url, headers, enabled)
+├── McpTool             ({ name, description, parameters, server_name })
+├── McpServerState      ({ name, config, status, tools, last_error })
+├── StdioConnection     (child: tokio::process::Child, stdin, stdout)
+├── HttpConnection      (reqwest::Client, url, headers, session_id)  ← SSE/HTTP
+├── Transport           (Stdio | Http)
+└── McpClientManager    (servers + conns + req_id)
+
+crates/hivecyber-core/src/agent/mcp_integration.rs
+├── SharedMcp           (Arc<Mutex<McpClientManager>>)
+├── load_and_connect()  (lee mcp_servers, registra, connect_all)
+├── register_mcp_tools()(agrega un McpToolProxy por tool al ToolRegistry)
+└── McpToolProxy        (impl hivecyber_tools::Tool → manager.call_tool)
 ```
 
 ## McpClientManager API
@@ -21,8 +34,8 @@ crates/hivecyber-mcp/src/lib.rs
 ```rust
 pub fn new() -> Self;
 pub fn register(&mut self, name: &str, config: McpServerConfig);
-pub async fn connect_server(&mut self, name: &str) -> Result<()>;
-pub async fn connect_all(&mut self) -> Vec<String>;  // returns errors
+pub async fn connect_server(&mut self, name: &str) -> Result<()>;   // stdio + sse
+pub async fn connect_all(&mut self) -> Vec<String>;  // devuelve errores
 pub async fn disconnect_server(&mut self, name: &str) -> Result<()>;
 pub async fn disconnect_all(&mut self);
 pub async fn call_tool(&mut self, server: &str, tool: &str, args: &Value) -> Result<Value>;
@@ -30,160 +43,79 @@ pub fn list_servers(&self) -> Vec<&McpServerState>;
 pub fn list_tools(&self) -> Vec<&McpTool>;
 ```
 
+## Transportes
+
+### stdio
+`spawn` del `command` con `args`/`env`; JSON-RPC line-delimited sobre stdin/stdout
+(stderr descartado). El proceso hijo se reap-ea en `disconnect_server`.
+
+### streamable-HTTP / SSE
+Cada mensaje JSON-RPC se hace `POST` a `url` con
+`Accept: application/json, text/event-stream`. La respuesta se acepta como cuerpo
+`application/json` **o** como el primer frame `data:` de un `text/event-stream`.
+El `Mcp-Session-Id` devuelto en `initialize` se guarda y se re-envía en cada
+request posterior. Transports admitidos: `sse`, `http`, `streamable-http`.
+
+Cubierto por el test de integración `crates/hivecyber-mcp/tests/sse_transport.rs`
+(servidor mock: initialize sobre SSE + session id, tools/list como JSON, tools/call).
+
 ## Protocolo JSON-RPC 2.0
 
-### initialize
+`initialize` → `notifications/initialized` → `tools/list` en connect;
+`tools/call` en cada invocación. (Ejemplos de payloads sin cambios respecto al
+estándar MCP 2024-11-05.)
 
-Request:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "initialize",
-  "params": {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {},
-    "clientInfo": {"name": "hivecyber", "version": "0.1.0"}
-  }
-}
-```
+## Integración con el agente (tool-sync)
 
-### notifications/initialized
+Equivalente en Rust del `mcp/tool-sync.ts` de Hive:
 
-Notification (no response):
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "notifications/initialized"
-}
-```
+1. En el arranque de `chat`/`run`/`resume`, `mcp_integration::load_and_connect`
+   lee `mcp_servers`, registra y conecta (best-effort: un server que falla no
+   tumba al resto).
+2. `register_mcp_tools` crea un `McpToolProxy` por cada tool descubierta y lo
+   registra en el `ToolRegistry`. **Los tools nativos ganan** ante colisión de
+   nombre (un tool MCP que se llame como un built-in se omite), para no ensombrecer
+   los tools con gate de seguridad.
+3. Al estar en el registry, los tools MCP entran automáticamente al tool-selector
+   BM25 — no hay un índice MCP aparte.
+4. El manager compartido (`SharedMcp`) se inyecta en `AgentLoopOptions.mcp_manager`
+   (loop del coordinador) y en `WorkerTaskExecutor`/`DispatchLoop` (workers).
 
-### tools/list
+## Configuración y persistencia
 
-Request:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/list",
-  "params": {}
-}
-```
-
-Response:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "result": {
-    "tools": [
-      {
-        "name": "search",
-        "description": "Search the web",
-        "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
-      }
-    ]
-  }
-}
-```
-
-### tools/call
-
-Request:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "tools/call",
-  "params": {
-    "name": "search",
-    "arguments": {"query": "nmap cheatsheet"}
-  }
-}
-```
-
-Response:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "result": {"content": [{"type": "text", "text": "..."}]}
-}
-```
-
-## Lifecycle de conexion
-
-```
-1. register(name, config) -> McpServerState.status = "disconnected"
-2. connect_server(name):
-   a. Si transport != "stdio" -> stub (status = "connected", sin spawn)
-   b. spawn Command::new(config.command).args(config.args).envs(config.env)
-      - stdin(Dpio::piped()), stdout(Stdio::piped()), stderr(Stdio::null())
-   c. Enviar initialize, esperar respuesta
-   d. Enviar notifications/initialized
-   e. Enviar tools/list, poblar state.tools
-   f. status = "connected"
-3. call_tool(server, tool, args):
-   a. Generar req_id (counter atomica)
-   b. Enviar tools/call con args
-   c. Leer respuesta por stdout (linea-delimited JSON)
-   d. Retornar result o error
-4. disconnect_server(name):
-   a. child.kill()
-   b. status = "disconnected", tools.clear()
-```
-
-## Configuracion
-
-MCP servers se configuran en la config global (pendiente de integrar con `config.rs`). Formato YAML:
-
-```yaml
-mcp:
-  enabled: true
-  servers:
-    filesystem:
-      transport: stdio
-      command: npx
-      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-    github:
-      transport: stdio
-      command: npx
-      args: ["-y", "@modelcontextprotocol/server-github"]
-      env:
-        GITHUB_PERSONAL_ACCESS_TOKEN: ghp_xxx
-    remote:
-      transport: sse
-      url: https://api.example.com/mcp
-      headers:
-        Authorization: Bearer token123
-```
-
-En MVP: la config esta cargada pero los servers no se auto-registran en boot. Pendiente wire con `config.mcp` y `McpClientManager::register` al iniciar.
-
-## Lazy connect (local-first)
-
-Hive promueve lazy connect: los servers MCP no se spawnean al registrar, sino cuando una tool los necesita. En hiveCyber MVP:
-- `connect_server` se invoca explicitamente via CLI (`hivecyber mcp connect <name>`)
-- Pendiente: timeout 8s para connect on-demand desde el agent loop cuando se referencia una tool MCP
-
-## Reconnect en stale-session
-
-Si `call_tool` recibe error 401 o session expired, Hive reconecta una vez y reintenta. En hiveCyber MVP: pendiente de implementar.
+Los servers viven en la colección `mcp_servers` (un doc por server, forma
+`McpServerConfig`). Se gestionan con `hivecyber mcp add/remove`. `config.mcp.enabled`
+(env `HIVECYBER_MCP_ENABLED`, default on) controla si se cargan.
 
 ## CLI
 
 ```bash
-hivecyber mcp list              # muestra servers registrados y status
-hivecyber mcp connect <name>    # intenta conectar explicitamente
+# stdio
+hivecyber mcp add fs --transport stdio --command npx \
+  --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp
+# sse / streamable-http
+hivecyber mcp add remote --transport sse --url https://api.example.com/mcp \
+  --header "Authorization=Bearer token123"
+
+hivecyber mcp list                 # servers registrados + status
+hivecyber mcp connect <name>       # conecta y lista sus tools
+hivecyber mcp tools [name]         # tools de un server (o de todos)
+hivecyber mcp call <name> <tool> '<json-args>'
+hivecyber mcp disconnect <name>
+hivecyber mcp remove <name>
 ```
+
+Nota: en modo CLI cada comando abre una conexión efímera (el proceso es
+corto). Las conexiones persistentes viven durante una sesión `chat`/`run`.
 
 ## Diferencias con Hive TS
 
 | Hive TS | hiveCyber Rust |
 |---|---|
-| `@modelcontextprotocol/sdk` | Implementacion nativa JSON-RPC |
-| SSE transport custom (`transports/sse.ts`) | Stub (pendiente reqwest event-stream) |
-| WebSocket transport custom (`transports/websocket.ts`) | Stub (pendiente tokio-tungstenite) |
-| Lazy connect on-demand 8s | Explicito via CLI en MVP |
-| Reconnect stale-session | Pendiente |
-| Hot-reload de config | Pendiente |
+| `@modelcontextprotocol/sdk` | Implementación nativa JSON-RPC |
+| SSE transport (`transports/sse.ts`) | Implementado (`reqwest`, session id) |
+| WebSocket transport (`transports/websocket.ts`) | Roadmap (`tokio-tungstenite` presente) |
+| tool-sync al índice de capacidades | `McpToolProxy` en el `ToolRegistry` → BM25 |
+| Lazy connect on-demand 8s | Connect en boot de `chat`/`run` |
+| Reconnect stale-session | Roadmap |
+| Hot-reload de config | Roadmap |

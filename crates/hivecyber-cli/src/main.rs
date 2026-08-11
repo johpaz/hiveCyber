@@ -17,6 +17,15 @@ struct Cli {
 
     #[arg(long, global = true)]
     allowlist_hosts: Option<PathBuf>,
+
+    #[arg(long, global = true)]
+    engagement_policy: Option<PathBuf>,
+
+    #[arg(long, global = true)]
+    allow_cli_exec: bool,
+
+    #[arg(long, global = true, value_name = "CATEGORY")]
+    approve_human: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -33,6 +42,15 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: AgentCommands,
+    },
+    Provider {
+        #[command(subcommand)]
+        action: ProviderCommands,
+    },
+    /// Catálogo de modelos (provider, context window, costo USD/1M).
+    Models {
+        #[arg(long)]
+        provider: Option<String>,
     },
     Skills {
         #[command(subcommand)]
@@ -63,6 +81,35 @@ enum AgentCommands {
     List,
     Show { id: String },
     Enable { id: String },
+    Disable { id: String },
+    /// Pin a model for an agent (empty string clears it → use the global default).
+    SetModel { id: String, model: String },
+    /// Pin a provider for an agent.
+    SetProvider { id: String, provider: String },
+}
+
+#[derive(Subcommand)]
+enum ProviderCommands {
+    /// Store an API key (encrypted) and optional base URL / model for a provider.
+    Set {
+        id: String,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// List known providers, whether a key is configured, and the current default.
+    List,
+    /// Show one provider's configuration (key masked).
+    Show { id: String },
+    /// Set the default provider (and optionally the default model).
+    Default {
+        id: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -70,12 +117,57 @@ enum SkillsCommands {
     List,
     Show { name: String },
     Reload,
+    /// Install a skill by copying its SKILL.md into the managed skills dir.
+    Add { path: PathBuf },
 }
 
 #[derive(Subcommand)]
 enum McpCommands {
+    /// Register an MCP server. stdio: --command (+ optional --args); sse/http: --url.
+    Add {
+        name: String,
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        #[arg(long)]
+        command: Option<String>,
+        /// Args for the stdio command (repeat: --arg -y --arg pkg). Hyphen-led
+        /// values are allowed so flags like `-y` pass through.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        #[arg(long)]
+        url: Option<String>,
+        /// Environment for the stdio process (repeat: --env KEY=VAL).
+        #[arg(long = "env", value_parser = parse_kv)]
+        env: Vec<(String, String)>,
+        /// HTTP headers for sse/http transport (repeat: --header KEY=VAL).
+        #[arg(long = "header", value_parser = parse_kv)]
+        header: Vec<(String, String)>,
+    },
+    /// List registered MCP servers and their last-known status.
     List,
+    /// Connect to a registered server and report the tools it exposes.
     Connect { name: String },
+    /// Disconnect (only meaningful for a long-lived process; validates config).
+    Disconnect { name: String },
+    /// List the tools of one server (or all connected servers).
+    Tools { name: Option<String> },
+    /// Call a tool on a server with JSON arguments.
+    Call {
+        name: String,
+        tool: String,
+        #[arg(default_value = "{}")]
+        args: String,
+    },
+    /// Remove a server from the registry.
+    Remove { name: String },
+}
+
+/// clap value parser for `KEY=VALUE` pairs.
+fn parse_kv(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) => Ok((k.to_string(), v.to_string())),
+        None => Err(format!("expected KEY=VALUE, got '{}'", s)),
+    }
 }
 
 #[derive(Subcommand)]
@@ -95,10 +187,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let config = Config::default();
+    let mut config = Config::default();
     let db_path = PathBuf::from(&config.home_dir).join("db");
 
     let db = Arc::new(HiveDb::open(&db_path).await?);
+
+    // Fold persisted operator settings (default provider/model, per-provider
+    // overrides) into the config; environment variables still win.
+    hivecyber_core::settings::Settings::load(&db)
+        .await
+        .apply_to_config(&mut config);
 
     let security = build_security_context(&cli);
 
@@ -106,7 +204,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Chat { agent } => cmd_chat(db.clone(), &config, &agent, security.clone()).await,
         Commands::Run { prompt, agent } => cmd_run(db.clone(), &config, &agent, &prompt, security.clone()).await,
         Commands::Agent { action } => cmd_agent(db.clone(), action).await,
-        Commands::Skills { action } => cmd_skills(db.clone(), action).await,
+        Commands::Provider { action } => cmd_provider(db.clone(), &config, action).await,
+        Commands::Models { provider } => cmd_models(db.clone(), provider).await,
+        Commands::Skills { action } => cmd_skills(db.clone(), &config, action).await,
         Commands::Mcp { action } => cmd_mcp(db.clone(), action).await,
         Commands::Config { action } => cmd_config(&config, action).await,
         Commands::Logs => cmd_logs(db.clone()).await,
@@ -146,24 +246,120 @@ fn build_security_context(cli: &Cli) -> Arc<hivecyber_tools::SecurityContext> {
     }
 
     let unsafe_mode = cli.unsafe_mode;
-    if unsafe_mode && allowlist.is_empty() {
+    if unsafe_mode && allowlist.is_empty() && cli.engagement_policy.is_none() {
         eprintln!("Warning: --unsafe-mode set but --allowlist-hosts not provided or empty");
         eprintln!("         dangerous commands will be rejected");
     }
 
+    // Load explicit EngagementPolicy YAML if provided; otherwise migrate the
+    // legacy --allowlist-hosts file into a permissive EngagementPolicy so the
+    // path/method/rate-limit/prohibited machinery is uniformly enforced.
+    let mut policy: Option<hivecyber_tools::EngagementPolicy> = None;
+    if let Some(ref ep_path) = cli.engagement_policy {
+        match std::fs::read_to_string(ep_path) {
+            Ok(content) => match serde_yaml::from_str::<hivecyber_tools::EngagementPolicy>(&content) {
+                Ok(p) => {
+                    eprintln!(
+                        "Loaded engagement policy '{}' with {} target(s) from {}",
+                        p.program,
+                        p.targets.len(),
+                        ep_path.display()
+                    );
+                    policy = Some(p);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to parse engagement policy {}: {}",
+                        ep_path.display(),
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to read engagement policy {}: {}",
+                    ep_path.display(),
+                    e
+                );
+            }
+        }
+    }
+    if policy.is_none() && !allowlist.is_empty() {
+        policy = Some(hivecyber_tools::EngagementPolicy::from_allowlist_hosts(&allowlist));
+    }
+
     let operator_id = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
 
-    Arc::new(hivecyber_tools::SecurityContext {
+    let security = Arc::new(hivecyber_tools::SecurityContext {
         unsafe_mode,
         allowlist_hosts: allowlist,
         operator_id,
-    })
+        engagement_policy: policy.map(Arc::new),
+        human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        allow_cli_exec: cli.allow_cli_exec,
+    });
+
+    for category in &cli.approve_human {
+        security.grant_human_approval(category);
+    }
+
+    security
+}
+
+/// Load + connect the configured MCP servers (if MCP is enabled). Returns the
+/// shared manager so its tools can be registered for every agent this command
+/// runs. Returns `None` when MCP is disabled so the whole feature is a no-op.
+async fn init_mcp(
+    db: &HiveDb,
+    config: &Config,
+) -> Option<hivecyber_core::agent::mcp_integration::SharedMcp> {
+    if !config.mcp.enabled {
+        return None;
+    }
+    Some(hivecyber_core::agent::mcp_integration::load_and_connect(db).await)
+}
+
+/// Bundled skills dir (relative to the CLI crate in dev; falls back to ./skills).
+fn bundled_skills_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../skills/bundled")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("./skills/bundled"))
+}
+
+/// Sync skills from the filesystem (bundled + managed) into `COL_SKILLS` so the
+/// agent loop's BM25 skill-selector can rank them. Best-effort.
+async fn sync_skills_to_db(db: &HiveDb, config: &Config) {
+    let managed = PathBuf::from(&config.skills.managed_dir);
+    let mut loader = hivecyber_skills::SkillLoader::new(&bundled_skills_dir(), &managed);
+    if loader.load_all().is_err() {
+        return;
+    }
+    for s in loader.list() {
+        let doc = serde_json::json!({
+            "id": s.name,
+            "name": s.name,
+            "description": s.description,
+            "category": s.category,
+            "version": s.version,
+            "tags": s.category,
+        });
+        let _ = db.insert(
+            hivecyber_core::store::collections::COL_SKILLS,
+            &s.name,
+            doc,
+        ).await;
+    }
 }
 
 async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Arc<hivecyber_tools::SecurityContext>) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     ensure_seed_agents(&db, config).await?;
+    sync_skills_to_db(&db, config).await;
+    hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
+
+    let mcp = init_mcp(&db, config).await;
 
     let agent = db
         .get(hivecyber_core::store::collections::COL_AGENTS, agent_id)
@@ -181,8 +377,8 @@ async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Ar
     let dispatch = std::sync::Arc::new(hivecyber_core::harness::DispatchLoop::new(
         (*db).clone(),
         config.clone(),
-    ).with_security(security.clone()));
-    install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue());
+    ).with_security(security.clone()).with_mcp(mcp.clone()));
+    install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue(), mcp.clone());
     dispatch.clone().start().await;
 
     let stdin = tokio::io::stdin();
@@ -223,6 +419,8 @@ async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Ar
             max_iterations: std::cmp::min(max_iter, 10),
             security: security.clone(),
             queue: Some(dispatch.queue()),
+            mcp_manager: mcp.clone(),
+            rehydrate: false,
         };
 
         let mut rx = loop_runner.run(opts).await?;
@@ -274,14 +472,18 @@ async fn cmd_run(
     security: Arc<hivecyber_tools::SecurityContext>,
 ) -> anyhow::Result<()> {
     ensure_seed_agents(&db, config).await?;
+    sync_skills_to_db(&db, config).await;
+    hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
 
     let thread_id = uuid::Uuid::new_v4().to_string();
+
+    let mcp = init_mcp(&db, config).await;
 
     let dispatch = Arc::new(hivecyber_core::harness::DispatchLoop::new(
         (*db).clone(),
         config.clone(),
-    ).with_security(security.clone()));
-    let active = install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue());
+    ).with_security(security.clone()).with_mcp(mcp.clone()));
+    let active = install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue(), mcp.clone());
     dispatch.clone().start().await;
 
     let opts = hivecyber_core::agent::loop_runner::AgentLoopOptions {
@@ -291,6 +493,8 @@ async fn cmd_run(
         max_iterations: 10,
         security: security.clone(),
         queue: Some(dispatch.queue()),
+        mcp_manager: mcp.clone(),
+        rehydrate: false,
     };
 
     *active.lock().await += 1;
@@ -364,6 +568,7 @@ fn install_terminal_hook(
     config: Config,
     security: Arc<hivecyber_tools::SecurityContext>,
     queue: Arc<hivecyber_core::harness::DurableQueue>,
+    mcp: Option<hivecyber_core::agent::mcp_integration::SharedMcp>,
 ) -> Arc<tokio::sync::Mutex<u32>> {
     let group_manager = Arc::new(
         hivecyber_core::harness::delegation_groups::DelegationGroupManager::new((*db).clone()),
@@ -386,6 +591,7 @@ fn install_terminal_hook(
         let processed = processed.clone();
         let pending_checks = pending_checks.clone();
         let active = active_hook.clone();
+        let mcp = mcp.clone();
         tokio::spawn(async move {
             handle_job_completion(
                 db,
@@ -397,6 +603,7 @@ fn install_terminal_hook(
                 active,
                 job_id,
                 result,
+                mcp,
             )
             .await;
             let mut pc = pending_checks.lock().unwrap();
@@ -418,6 +625,7 @@ async fn handle_job_completion(
     active: Arc<tokio::sync::Mutex<u32>>,
     job_id: String,
     result: serde_json::Value,
+    mcp: Option<hivecyber_core::agent::mcp_integration::SharedMcp>,
 ) {
     use hivecyber_core::agent::loop_runner::AgentLoopOptions;
     use hivecyber_core::store::collections::{COL_DELEGATION_GROUPS, COL_JOBS, COL_TASKS};
@@ -533,6 +741,8 @@ async fn handle_job_completion(
             max_iterations: 10,
             security,
             queue: Some(queue),
+            mcp_manager: mcp,
+            rehydrate: false,
         };
         if let Err(e) = run_agent_and_print(db2, &config2, opts).await {
             eprintln!("[sistema] error en reinyeccion: {}", e);
@@ -567,37 +777,243 @@ async fn cmd_agent(db: Arc<HiveDb>, action: AgentCommands) -> anyhow::Result<()>
             println!("{}", serde_json::to_string_pretty(&agent)?);
         }
         AgentCommands::Enable { id } => {
-            let mut agent = db
-                .get(hivecyber_core::store::collections::COL_AGENTS, &id)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("agent not found"))?;
-            if let Some(obj) = agent.as_object_mut() {
+            update_agent(&db, &id, |obj| {
                 obj.insert("enabled".into(), serde_json::json!(true));
                 obj.insert("status".into(), serde_json::json!("active"));
-                obj.insert("updated_at".into(), chrono::Utc::now().to_rfc3339().into());
-            }
-            db.insert(hivecyber_core::store::collections::COL_AGENTS, &id, agent).await?;
+            })
+            .await?;
             println!("Agent '{}' enabled.", id);
+        }
+        AgentCommands::Disable { id } => {
+            update_agent(&db, &id, |obj| {
+                obj.insert("enabled".into(), serde_json::json!(false));
+                obj.insert("status".into(), serde_json::json!("disabled"));
+            })
+            .await?;
+            println!("Agent '{}' disabled.", id);
+        }
+        AgentCommands::SetModel { id, model } => {
+            let m = model.clone();
+            update_agent(&db, &id, move |obj| {
+                if m.is_empty() {
+                    obj.remove("model_id");
+                } else {
+                    obj.insert("model_id".into(), serde_json::json!(m));
+                }
+            })
+            .await?;
+            if model.is_empty() {
+                println!("Agent '{}' model cleared (uses global default).", id);
+            } else {
+                println!("Agent '{}' model set to '{}'.", id, model);
+            }
+        }
+        AgentCommands::SetProvider { id, provider } => {
+            let p = provider.clone();
+            update_agent(&db, &id, move |obj| {
+                obj.insert("provider_id".into(), serde_json::json!(p));
+            })
+            .await?;
+            println!("Agent '{}' provider set to '{}'.", id, provider);
         }
     }
     Ok(())
 }
 
-async fn cmd_skills(db: Arc<HiveDb>, action: SkillsCommands) -> anyhow::Result<()> {
-    let _ = db;
-    let bundled = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../skills/bundled")
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from("./skills/bundled"));
-    let managed = std::path::PathBuf::from(
-        std::env::var("HIVECYBER_HOME").unwrap_or_else(|_| {
-            directories::ProjectDirs::from("ai", "hivecyber", "hivecyber")
-                .map(|d| d.data_dir().to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("{}/.hivecyber", std::env::var("HOME").unwrap_or_default()))
-        }),
-    ).join("skills");
+/// Load an agent doc, apply `mutate` to its object, stamp `updated_at`, save.
+async fn update_agent(
+    db: &HiveDb,
+    id: &str,
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> anyhow::Result<()> {
+    let mut agent = db
+        .get(hivecyber_core::store::collections::COL_AGENTS, id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("agent not found: {}", id))?;
+    let obj = agent
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("agent doc is not an object"))?;
+    mutate(obj);
+    obj.insert("updated_at".into(), chrono::Utc::now().to_rfc3339().into());
+    db.insert(hivecyber_core::store::collections::COL_AGENTS, id, agent).await
+}
 
-    let mut loader = hivecyber_skills::SkillLoader::new(&bundled, &managed);
+/// Mask a secret for display: first 4 + last 4 chars, middle elided.
+fn mask_secret(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 8 {
+        "*".repeat(n.max(1))
+    } else {
+        let first: String = s.chars().take(4).collect();
+        let last: String = s.chars().skip(n - 4).collect();
+        format!("{}…{}", first, last)
+    }
+}
+
+async fn cmd_provider(
+    db: Arc<HiveDb>,
+    config: &Config,
+    action: ProviderCommands,
+) -> anyhow::Result<()> {
+    use hivecyber_core::security::crypto::{provider_key_name, resolve_api_key, SecretStore};
+    use hivecyber_core::settings::Settings;
+    use hivecyber_providers::ProviderRegistry;
+
+    let known = ProviderRegistry::new().list_providers();
+    let is_known = |id: &str| known.iter().any(|p| p == id);
+
+    match action {
+        ProviderCommands::Set {
+            id,
+            api_key,
+            base_url,
+            model,
+        } => {
+            if !is_known(&id) {
+                anyhow::bail!(
+                    "unknown provider '{}'. Known: {}",
+                    id,
+                    known.join(", ")
+                );
+            }
+            if let Some(key) = api_key {
+                let store = SecretStore::open(&config.home_dir)?;
+                store.store(&db, &provider_key_name(&id), &key).await?;
+                println!("API key for '{}' guardada (cifrada).", id);
+            }
+            if base_url.is_some() || model.is_some() {
+                let mut settings = Settings::load(&db).await;
+                {
+                    let entry = settings.provider_entry(&id);
+                    if let Some(u) = base_url {
+                        entry.base_url = Some(u);
+                    }
+                    if let Some(m) = model {
+                        entry.model = Some(m);
+                    }
+                }
+                settings.save(&db).await?;
+                println!("Configuración de '{}' actualizada.", id);
+            }
+        }
+        ProviderCommands::List => {
+            let settings = Settings::load(&db).await;
+            println!(
+                "{:<14} {:<8} {:<10} {}",
+                "PROVIDER", "KEY", "DEFAULT", "MODEL"
+            );
+            for id in &known {
+                let key = resolve_api_key(&db, &config.home_dir, id).await;
+                let configured = if key.is_empty() { "-" } else { "set" };
+                let is_default = if *id == config.models.default_provider {
+                    "*"
+                } else {
+                    ""
+                };
+                let model = settings
+                    .providers
+                    .get(id)
+                    .and_then(|p| p.model.clone())
+                    .or_else(|| ProviderRegistry::new().default_model_for(id))
+                    .unwrap_or_default();
+                println!("{:<14} {:<8} {:<10} {}", id, configured, is_default, model);
+            }
+            println!(
+                "\ndefault provider: {}  ·  default model: {}",
+                config.models.default_provider,
+                if config.models.default_model.is_empty() {
+                    "(provider default)"
+                } else {
+                    &config.models.default_model
+                }
+            );
+        }
+        ProviderCommands::Show { id } => {
+            if !is_known(&id) {
+                anyhow::bail!("unknown provider '{}'. Known: {}", id, known.join(", "));
+            }
+            let settings = Settings::load(&db).await;
+            let key = resolve_api_key(&db, &config.home_dir, &id).await;
+            let ps = settings.providers.get(&id);
+            println!("provider:   {}", id);
+            println!(
+                "api_key:    {}",
+                if key.is_empty() {
+                    "(no configurada)".to_string()
+                } else {
+                    mask_secret(&key)
+                }
+            );
+            println!(
+                "base_url:   {}",
+                ps.and_then(|p| p.base_url.clone())
+                    .unwrap_or_else(|| "(built-in)".into())
+            );
+            println!(
+                "model:      {}",
+                ps.and_then(|p| p.model.clone())
+                    .or_else(|| ProviderRegistry::new().default_model_for(&id))
+                    .unwrap_or_else(|| "(provider default)".into())
+            );
+            println!(
+                "is_default: {}",
+                id == config.models.default_provider
+            );
+        }
+        ProviderCommands::Default { id, model } => {
+            if !is_known(&id) {
+                anyhow::bail!("unknown provider '{}'. Known: {}", id, known.join(", "));
+            }
+            let mut settings = Settings::load(&db).await;
+            settings.default_provider = Some(id.clone());
+            if let Some(m) = model {
+                settings.default_model = Some(m);
+            }
+            settings.save(&db).await?;
+            let m = settings.default_model.clone().unwrap_or_else(|| "(provider default)".into());
+            println!("Default provider = '{}', model = '{}'.", id, m);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_models(db: Arc<HiveDb>, provider: Option<String>) -> anyhow::Result<()> {
+    let _ = db;
+    let mut models = hivecyber_core::agent::models_catalog::model_catalog();
+    if let Some(p) = &provider {
+        models.retain(|m| &m.provider_id == p);
+    }
+    models.sort_by(|a, b| {
+        a.provider_id.cmp(&b.provider_id).then(a.model_id.cmp(&b.model_id))
+    });
+    if models.is_empty() {
+        println!("No hay modelos (provider '{}' desconocido).", provider.unwrap_or_default());
+        return Ok(());
+    }
+    println!(
+        "{:<13} {:<34} {:>9} {:>9} {:>9}",
+        "PROVIDER", "MODEL", "CTX", "IN/1M", "OUT/1M"
+    );
+    for m in &models {
+        let mid: String = if m.model_id.chars().count() > 34 {
+            format!("{}…", m.model_id.chars().take(33).collect::<String>())
+        } else {
+            m.model_id.clone()
+        };
+        println!(
+            "{:<13} {:<34} {:>9} {:>9.3} {:>9.3}",
+            m.provider_id, mid, m.context_window, m.input_per_1m, m.output_per_1m
+        );
+    }
+    println!("\n{} modelos (costo en USD por 1M tokens; ctx = context window)", models.len());
+    Ok(())
+}
+
+async fn cmd_skills(db: Arc<HiveDb>, config: &Config, action: SkillsCommands) -> anyhow::Result<()> {
+    let _ = db;
+    let managed = std::path::PathBuf::from(&config.skills.managed_dir);
+
+    let mut loader = hivecyber_skills::SkillLoader::new(&bundled_skills_dir(), &managed);
     if let Err(e) = loader.load_all() {
         eprintln!("Error loading skills: {}", e);
     }
@@ -632,18 +1048,187 @@ async fn cmd_skills(db: Arc<HiveDb>, action: SkillsCommands) -> anyhow::Result<(
             loader.load_all()?;
             println!("Skills reloaded: {} skills", loader.list().len());
         }
+        SkillsCommands::Add { path } => {
+            // Accept either a skill directory (containing SKILL.md) or the
+            // SKILL.md file itself; copy the whole skill dir into the managed
+            // dir under its basename, then reload.
+            let src_dir = if path.is_file() {
+                path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+            } else {
+                path.clone()
+            };
+            let skill_md = src_dir.join("SKILL.md");
+            if !skill_md.exists() {
+                anyhow::bail!("no SKILL.md found in {}", src_dir.display());
+            }
+            let name = src_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .ok_or_else(|| anyhow::anyhow!("cannot determine skill name from path"))?;
+            let dest = managed.join(&name);
+            copy_dir_recursive(&src_dir, &dest)?;
+            println!("Skill '{}' instalada en {}", name, dest.display());
+            loader.load_all()?;
+            match loader.get(&name) {
+                Some(s) => println!("Cargada: {} — {}", s.name, s.description.chars().take(80).collect::<String>()),
+                None => println!("Aviso: copiada pero el loader no la reconoció (revisa SKILL.md)."),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy `src` directory into `dest` (creating `dest`).
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
     }
     Ok(())
 }
 
 async fn cmd_mcp(db: Arc<HiveDb>, action: McpCommands) -> anyhow::Result<()> {
-    let _ = db;
+    use hivecyber_core::store::collections::COL_MCP_SERVERS;
+    use hivecyber_mcp::{McpClientManager, McpServerConfig};
+
+    // Build a one-shot manager holding a single named server (loaded from the
+    // registry) and connect it. Used by connect/tools/call — the CLI is
+    // short-lived so connections don't persist across invocations; each command
+    // spins the server up, does its work, and lets it drop.
+    async fn connect_one(db: &HiveDb, name: &str) -> anyhow::Result<McpClientManager> {
+        let doc = db
+            .get(COL_MCP_SERVERS, name)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("server not registered: {} (run `mcp add`)", name))?;
+        let cfg: McpServerConfig = serde_json::from_value(doc)
+            .map_err(|e| anyhow::anyhow!("bad config for '{}': {}", name, e))?;
+        let mut mgr = McpClientManager::new();
+        mgr.register(name, cfg);
+        mgr.connect_server(name).await?;
+        Ok(mgr)
+    }
+
     match action {
+        McpCommands::Add {
+            name,
+            transport,
+            command,
+            args,
+            url,
+            env,
+            header,
+        } => {
+            match transport.as_str() {
+                "stdio" => {
+                    if command.is_none() {
+                        anyhow::bail!("stdio transport requires --command");
+                    }
+                }
+                "sse" | "http" | "streamable-http" => {
+                    if url.is_none() {
+                        anyhow::bail!("{} transport requires --url", transport);
+                    }
+                }
+                other => anyhow::bail!("unsupported transport '{}' (use stdio|sse|http)", other),
+            }
+            let cfg = McpServerConfig {
+                enabled: true,
+                transport,
+                command,
+                args: if args.is_empty() { None } else { Some(args) },
+                env: env.into_iter().collect(),
+                url,
+                headers: header.into_iter().collect(),
+            };
+            db.insert(COL_MCP_SERVERS, &name, serde_json::to_value(&cfg)?).await?;
+            println!("MCP server '{}' registrado ({}).", name, cfg.transport);
+            println!("Conecta con: hivecyber mcp connect {}", name);
+        }
         McpCommands::List => {
-            println!("MCP servers (skeleton phase — no servers registered)");
+            let servers = db.list(COL_MCP_SERVERS).await;
+            if servers.is_empty() {
+                println!("No hay servidores MCP registrados. Agrega uno con `hivecyber mcp add`.");
+            } else {
+                println!("Servidores MCP registrados:");
+                for (name, doc) in servers {
+                    let transport = doc.get("transport").and_then(|v| v.as_str()).unwrap_or("?");
+                    let enabled = doc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let target = doc
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| doc.get("url").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    println!(
+                        "  {:<20} {:<8} {:<6} {}",
+                        name,
+                        transport,
+                        if enabled { "on" } else { "off" },
+                        target
+                    );
+                }
+            }
         }
         McpCommands::Connect { name } => {
-            println!("Connecting to MCP server '{}' (skeleton phase)", name);
+            let mgr = connect_one(&db, &name).await?;
+            let tools = mgr.list_tools();
+            println!("Conectado a '{}' — {} tool(s):", name, tools.len());
+            for t in tools {
+                println!("  {} — {}", t.name, t.description);
+            }
+        }
+        McpCommands::Disconnect { name } => {
+            // Nothing persists across CLI runs; validate the server exists so the
+            // command is honest rather than a silent no-op.
+            if db.get(COL_MCP_SERVERS, &name).await.is_none() {
+                anyhow::bail!("server not registered: {}", name);
+            }
+            println!("'{}' no tiene conexiones persistentes en modo CLI (no-op).", name);
+        }
+        McpCommands::Tools { name } => match name {
+            Some(name) => {
+                let mgr = connect_one(&db, &name).await?;
+                let tools = mgr.list_tools();
+                println!("{} tool(s) en '{}':", tools.len(), name);
+                for t in tools {
+                    println!("  {} — {}", t.name, t.description);
+                }
+            }
+            None => {
+                let servers = db.list(COL_MCP_SERVERS).await;
+                for (name, _) in servers {
+                    match connect_one(&db, &name).await {
+                        Ok(mgr) => {
+                            println!("[{}]", name);
+                            for t in mgr.list_tools() {
+                                println!("  {} — {}", t.name, t.description);
+                            }
+                        }
+                        Err(e) => println!("[{}] error: {}", name, e),
+                    }
+                }
+            }
+        },
+        McpCommands::Call { name, tool, args } => {
+            let parsed: serde_json::Value = serde_json::from_str(&args)
+                .map_err(|e| anyhow::anyhow!("args no es JSON valido: {}", e))?;
+            let mut mgr = connect_one(&db, &name).await?;
+            let result = mgr.call_tool(&name, &tool, &parsed).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        McpCommands::Remove { name } => {
+            if db.get(COL_MCP_SERVERS, &name).await.is_none() {
+                anyhow::bail!("server not registered: {}", name);
+            }
+            db.delete(COL_MCP_SERVERS, &name).await?;
+            println!("MCP server '{}' eliminado.", name);
         }
     }
     Ok(())
@@ -690,6 +1275,9 @@ async fn cmd_resume(db: Arc<HiveDb>, config: &Config, run_id: &str, security: Ar
 
     println!("Resuming run {} (agent={}, thread={})", run_id, agent_id, thread_id);
 
+    sync_skills_to_db(&db, config).await;
+    hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
+    let mcp = init_mcp(&db, config).await;
     let loop_runner = AgentLoop::new((*db).clone(), config.clone());
     let opts = hivecyber_core::agent::loop_runner::AgentLoopOptions {
         agent_id: agent_id.to_string(),
@@ -698,6 +1286,8 @@ async fn cmd_resume(db: Arc<HiveDb>, config: &Config, run_id: &str, security: Ar
         max_iterations: 10,
         security: security.clone(),
         queue: None,
+        mcp_manager: mcp,
+        rehydrate: true,
     };
 
     let mut rx = loop_runner.run(opts).await?;
@@ -734,24 +1324,97 @@ async fn cmd_doctor() -> anyhow::Result<()> {
         ("crackmapexec", "crackmapexec"),
     ];
 
-    println!("hivecyber doctor — verificando dependencias:\n");
-    let mut missing = 0;
-    for (name, binary) in &tools {
-        let found = std::process::Command::new("which")
-            .arg(binary)
-            .output()
-            .map(|o| o.status.success())
+    // Platform banner + sandbox availability (this is what differs per OS).
+    println!(
+        "hivecyber doctor — plataforma: {} / {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    if cfg!(target_os = "linux") {
+        println!("  Sandbox del worker: DISPONIBLE (seccomp + rlimits + namespaces) — las tools");
+        println!("  Isolation::Sandbox (metasploit_rpc, hydra, crackmapexec, mimikatz) se confinan.");
+    } else {
+        let opted = std::env::var("HIVECYBER_ALLOW_UNSANDBOXED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-
-        if found {
-            println!("  [OK] {} ({})", name, binary);
+        println!(
+            "  Sandbox del worker: NO DISPONIBLE en {} — las tools Isolation::Sandbox se",
+            std::env::consts::OS
+        );
+        if opted {
+            println!("  RECHAZAN por defecto, pero HIVECYBER_ALLOW_UNSANDBOXED=1 está activo → correrán SIN confinar (inseguro).");
         } else {
-            println!("  [MISSING] {} ({})", name, binary);
-            missing += 1;
+            println!("  RECHAZAN por defecto (fail-closed). Usa la imagen Docker (Linux), o exporta");
+            println!("  HIVECYBER_ALLOW_UNSANDBOXED=1 para forzarlas sin confinar (inseguro). Ver docs/distribution.md");
         }
     }
+    // agent-browser (subproceso Chrome) — dependencia opcional para browser_*.
+    let ab = std::env::var("AGENT_BROWSER_BIN").unwrap_or_else(|_| "agent-browser".into());
+    let ab_ok = find_in_path(&ab).is_some();
+    println!(
+        "  agent-browser: {} (tools browser_*)",
+        if ab_ok { "OK" } else { "MISSING (opcional)" }
+    );
+
+    println!("\nDependencias cybersec (shell-out):\n");
+    let mut missing_bins: Vec<&str> = Vec::new();
+    for (name, binary) in &tools {
+        if find_in_path(binary).is_some() {
+            println!("  [OK]      {} ({})", name, binary);
+        } else {
+            println!("  [MISSING] {} ({})", name, binary);
+            missing_bins.push(binary);
+        }
+    }
+    let missing = missing_bins.len();
     println!("\n{} tools found, {} missing", tools.len() - missing, missing);
+
+    if missing > 0 {
+        println!("\nInstalación (según tu SO):");
+        match std::env::consts::OS {
+            "linux" => {
+                println!("  # Debian/Ubuntu (subset en apt):");
+                println!("  sudo apt install -y nmap nikto hydra yara whois dnsutils zeek osquery");
+                println!("  # nuclei/trivy/semgrep/theHarvester/volatility3: instaladores propios (go/pip/pipx)");
+                println!("  # Toolchain completo sin instalar nada: usa la imagen Docker.");
+            }
+            "macos" => {
+                println!("  brew install nmap nikto hydra yara nuclei trivy semgrep zeek");
+                println!("  # metasploit/crackmapexec/volatility3: ver sus docs; o usa Docker (Linux) para el sandbox.");
+            }
+            "windows" => {
+                println!("  choco install nmap  # cobertura parcial en Windows");
+                println!("  # Recomendado en Windows: WSL2 o la imagen Docker (Linux) — habilita además el sandbox seccomp.");
+            }
+            other => println!("  (SO '{}' no reconocido — instala las tools manualmente)", other),
+        }
+    }
     Ok(())
+}
+
+/// Cross-platform PATH lookup for an executable (replaces shelling out to
+/// `which`, which does not exist on Windows). On Windows, tries the `PATHEXT`
+/// extensions.
+fn find_in_path(binary: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
+            .split(';')
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&paths) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{}{}", binary, ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 async fn cmd_audit(db: Arc<HiveDb>, action: AuditCommands) -> anyhow::Result<()> {

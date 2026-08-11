@@ -210,7 +210,7 @@ Usado por `DelegationGroupManager` para:
 
 ## Pendiente vs Hive TS
 
-| Hive TS | hiveCyber Rust MVP |
+| Hive TS | hiveCyber Rust |
 |---|---|
 | `prepareDelegation` expande tool_allowlist + lease MCP + resolve model | Implementado (WorkerTaskExecutor) |
 | `runAgentIsolated` worker | Implementado en executors.rs (loop inline) |
@@ -218,6 +218,6 @@ Usado por `DelegationGroupManager` para:
 | DelegationGroupManager | Implementado (create/register/record/is_complete) |
 | Reinyeccion `[Sistema]`Coordinator | Pendiente (terminal hook declarado pero coordinador loop no lo consume) |
 | `task_revise` (mismo thread) | Pendiente |
-| `task_status` tool | Stub |
+| `task_status` tool | Implementado (lee COL_TASKS) |
 | `chat_turn` lane bypass global cap | Pendiente |
 | `goal_run` executor | Pendiente |

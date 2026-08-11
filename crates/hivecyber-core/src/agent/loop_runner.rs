@@ -42,6 +42,14 @@ pub struct AgentLoopOptions {
     pub max_iterations: u32,
     pub security: Arc<hivecyber_tools::SecurityContext>,
     pub queue: Option<Arc<crate::harness::DurableQueue>>,
+    /// Connected MCP servers, if any. Their tools are registered as normal
+    /// tools so they flow through the BM25 tool-selector like everything else.
+    pub mcp_manager: Option<crate::agent::mcp_integration::SharedMcp>,
+    /// When true, rebuild the prior conversation from `COL_MESSAGES` (this
+    /// thread) before appending `user_message` — used by `resume` so the run
+    /// continues with real history instead of a cold prompt.
+    #[allow(dead_code)]
+    pub rehydrate: bool,
 }
 
 pub struct AgentLoop {
@@ -88,7 +96,7 @@ async fn run_loop(
     opts: AgentLoopOptions,
     tx: mpsc::Sender<StreamChunk>,
 ) -> Result<()> {
-    use hivecyber_providers::{ProviderRegistry, CallRequest, Content};
+    use hivecyber_providers::{CallRequest, Content};
 
     let agent = db
         .get(crate::store::collections::COL_AGENTS, &opts.agent_id)
@@ -101,41 +109,47 @@ async fn run_loop(
         .or_else(|| Some(config.models.default_provider.as_str()))
         .unwrap_or("anthropic");
 
+    // Model resolution: agent's own model_id, else the global config default,
+    // else empty — an empty model tells ProviderRegistry::get to use that
+    // provider's own default_model, so we never hardcode (and never let stale)
+    // per-provider model ids drift out of date here.
     let model = agent
         .get("model_id")
         .and_then(|v| v.as_str())
-        .unwrap_or(match provider {
-            "anthropic" => "claude-sonnet-4-20250514",
-            "gemini" => "gemini-3.6-flash",
-            "openai" => "gpt-4o",
-            "ollama" => "llama3.2",
-            "groq" => "llama-3.3-70b-versatile",
-            "opencode_go" => "kimi-k2.6",
-            _ => "gpt-4o",
-        });
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&config.models.default_model);
 
-    let api_key = match provider {
-        "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
-        "openai" => std::env::var("OPENAI_API_KEY").ok(),
-        "gemini" => std::env::var("GEMINI_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("GOOGLE_API_KEY").ok()),
-        "ollama" => std::env::var("OLLAMA_API_KEY").ok().or(Some(String::new())),
-        "groq" => std::env::var("GROQ_API_KEY").ok(),
-        "opencode_go" => std::env::var("OPENCODE_GO_API_KEY").ok(),
-        _ => std::env::var("ANTHROPIC_API_KEY").ok(),
-    }
-    .unwrap_or_default();
+    // API key resolution: environment variable first, then the encrypted secret
+    // store (so a host configured via `provider set` runs with no env vars). The
+    // registry knows every provider (hiveagents, deepseek, qwen, …).
+    let api_key =
+        crate::security::crypto::resolve_api_key(&db, &config.home_dir, provider).await;
 
-    let registry = ProviderRegistry::new();
+    let registry = crate::settings::registry_for(&db).await;
     let client = registry
         .get(provider, model, &api_key)
         .ok_or_else(|| anyhow::anyhow!("provider not configured: {}", provider))?;
 
-    let system_prompt = agent
+    // Effective model id (agent/config, else the provider's default) → used to
+    // look up the real context window for the compaction budget.
+    let effective_model = if model.is_empty() {
+        registry.default_model_for(provider).unwrap_or_default()
+    } else {
+        model.to_string()
+    };
+    let context_budget = crate::agent::models_catalog::resolve_context_budget(
+        &db,
+        provider,
+        &effective_model,
+        config.models.context_token_budget,
+    )
+    .await;
+
+    let mut system_prompt = agent
         .get("system_prompt")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(opts.security.clone());
 
@@ -150,13 +164,106 @@ async fn run_loop(
                 db: db.clone(),
                 queue,
             });
-            tool_registry.register(Arc::new(hivecyber_tools::delegation::TaskDelegate { db: backend }));
+            tool_registry.register(Arc::new(hivecyber_tools::delegation::TaskDelegate {
+                db: backend.clone(),
+            }));
+            tool_registry.register(Arc::new(hivecyber_tools::delegation::TaskStatus {
+                db: backend.clone(),
+            }));
+            tool_registry.register(Arc::new(hivecyber_tools::delegation::TaskList {
+                db: backend.clone(),
+            }));
+            tool_registry.register(Arc::new(hivecyber_tools::delegation::TaskRevise {
+                db: backend,
+            }));
         }
     }
+
+    // Durable agent memory (write/read/list/search) for every agent — the
+    // long-running coordinator especially benefits from recalling findings
+    // across turns. Surfaced by the BM25 tool-selector when relevant.
+    {
+        let mem = Arc::new(crate::agent::memory_backend::MemoryBackend { db: db.clone() });
+        tool_registry.register(Arc::new(hivecyber_tools::memory::MemoryWrite { db: mem.clone() }));
+        tool_registry.register(Arc::new(hivecyber_tools::memory::MemoryRead { db: mem.clone() }));
+        tool_registry.register(Arc::new(hivecyber_tools::memory::MemoryList { db: mem.clone() }));
+        tool_registry.register(Arc::new(hivecyber_tools::memory::MemorySearch { db: mem }));
+    }
+
+    // Expose the connected MCP servers' tools to this agent. Registered after
+    // the native + delegation tools so a colliding MCP tool name never shadows
+    // a security-gated built-in (native wins). They then flow through the BM25
+    // tool-selector below like any other tool.
+    if let Some(mcp) = opts.mcp_manager.as_ref() {
+        let n = crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp).await;
+        if n > 0 {
+            tracing::info!("registered {} MCP tool(s) for agent {}", n, opts.agent_id);
+        }
+    }
+
+    // Live routing context (BM25): for the coordinator, append the worker roster
+    // ranked against this request plus the full routing catalog with exclusions —
+    // the previously-static worker table becomes a live routing aid. For every
+    // agent, surface the skills most relevant to the task. Both are appended to
+    // the system prompt; empty when there is nothing relevant.
+    if role == "coordinator" {
+        let ctx = crate::agent::routing_context::build_coordinator_context(&db, &opts.user_message).await;
+        if !ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&ctx);
+        }
+    }
+    {
+        let skills_ctx = crate::agent::routing_context::build_skill_context(&db, &opts.user_message).await;
+        if !skills_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&skills_ctx);
+        }
+    }
+
+    // Dynamic tool selection (BM25): send the model only the tools relevant to
+    // this task, not the whole catalog — fewer tokens, better precision. The
+    // selection is made once from the initiating message and reused for the
+    // whole loop. Safety rails: delegation tools (`task_*`) are always kept,
+    // and if nothing scores above the cutoff (and it is not a conversational
+    // message) we fall back to the full set so the agent is never left
+    // tool-less. See agent/tool_selector.rs.
+    let descriptors: Vec<crate::agent::tool_selector::ToolDescriptor> = tool_registry
+        .all()
+        .iter()
+        .map(|t| crate::agent::tool_selector::ToolDescriptor {
+            name: t.name().into(),
+            description: t.description().into(),
+            category: format!("{:?}", t.category()).to_lowercase(),
+        })
+        .collect();
+
+    let selection = crate::agent::tool_selector::select_tools(&opts.user_message, &descriptors);
+    let mut active_names: std::collections::HashSet<String> =
+        selection.selected.iter().cloned().collect();
+    // Always keep delegation tools available to the coordinator.
+    for d in &descriptors {
+        if d.name.starts_with("task_") {
+            active_names.insert(d.name.clone());
+        }
+    }
+    // Fallback: real request but no strong match → keep the full catalog.
+    if !selection.conversational && !selection.matched {
+        for d in &descriptors {
+            active_names.insert(d.name.clone());
+        }
+    }
+    tracing::debug!(
+        "tool-selector: {} of {} tools active ({})",
+        active_names.len(),
+        descriptors.len(),
+        selection.reasoning
+    );
 
     let tool_defs: Vec<hivecyber_providers::ToolDef> = tool_registry
         .all()
         .iter()
+        .filter(|t| active_names.contains(t.name()))
         .map(|t| hivecyber_providers::ToolDef {
             name: t.name().into(),
             description: t.description().into(),
@@ -168,31 +275,81 @@ async fn run_loop(
 
     let mut messages: Vec<hivecyber_providers::Message> = Vec::new();
 
-    let user_msg = hivecyber_providers::Message {
-        role: "user".into(),
-        content: Content::Text(opts.user_message.clone()),
-    };
-    messages.push(user_msg.clone());
+    // Resume: rebuild the prior conversation for this thread from COL_MESSAGES
+    // (clean user/assistant turns — tool turns are not persisted, so there are no
+    // orphaned tool_result blocks to worry about).
+    if opts.rehydrate {
+        messages = load_thread_history(&db, &opts.thread_id).await;
+        if !messages.is_empty() {
+            let _ = tx
+                .send(StreamChunk::Agent {
+                    text: format!("[sistema] Rehidratados {} mensajes del hilo.\n", messages.len()),
+                })
+                .await;
+        }
+    }
 
-    let _ = db
-        .insert(
-            crate::store::collections::COL_MESSAGES,
-            &uuid::Uuid::new_v4().to_string(),
-            serde_json::to_value(&crate::store::collections::MessageDoc {
-                id: uuid::Uuid::new_v4().to_string(),
-                thread_id: opts.thread_id.clone(),
-                role: "user".into(),
-                content: serde_json::Value::String(opts.user_message),
-                tool_calls: None,
-                tool_call_id: None,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            })?,
-        )
-        .await;
+    // Append the current user turn, unless rehydration already left an
+    // unanswered user turn at the tail (avoid two consecutive user messages).
+    let ends_with_user = messages.last().map(|m| m.role == "user").unwrap_or(false);
+    if !(opts.rehydrate && ends_with_user) {
+        messages.push(hivecyber_providers::Message {
+            role: "user".into(),
+            content: Content::Text(opts.user_message.clone()),
+        });
+        let _ = db
+            .insert(
+                crate::store::collections::COL_MESSAGES,
+                &uuid::Uuid::new_v4().to_string(),
+                serde_json::to_value(&crate::store::collections::MessageDoc {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    thread_id: opts.thread_id.clone(),
+                    role: "user".into(),
+                    content: serde_json::Value::String(opts.user_message.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                })?,
+            )
+            .await;
+    }
 
     let mut stuck = crate::agent::stuck::StuckLoopDetector::new();
 
+    // Every tool call in the interactive/coordinator loop must go through the
+    // audited middleware — same as the worker path in harness/executors.rs.
+    // Otherwise Isolation::Sandbox tools (metasploit_rpc, hydra, crackmapexec,
+    // mimikatz) would run in-process unsandboxed and nothing would be written to
+    // the tamper-evident audit log. The interactive loop has no durable job, so
+    // the conversation's thread_id is used as the run identifier.
+    let middleware = crate::tool_runtime::middleware::ToolMiddleware::new(
+        db.clone(),
+        opts.security.clone(),
+    );
+    let audit_ctx = crate::tool_runtime::middleware::AuditCtx {
+        worker: opts.agent_id.clone(),
+        run_id: opts.thread_id.clone(),
+        operator_id: opts.security.operator_id.clone(),
+    };
+
     for _iteration in 0..max_iter {
+        // Compact the in-memory working set if it has grown past the budget.
+        // Only the working set is touched — COL_MESSAGES stays the full,
+        // append-only record (used for audit and resume).
+        if crate::agent::compaction::maybe_compact(
+            &client,
+            &mut messages,
+            context_budget,
+        )
+        .await
+        {
+            let _ = tx
+                .send(StreamChunk::Agent {
+                    text: "[sistema] Contexto compactado para continuar la operación.\n".into(),
+                })
+                .await;
+        }
+
         let req = CallRequest {
             system: Some(system_prompt.to_string()),
             messages: messages.clone(),
@@ -277,10 +434,12 @@ async fn run_loop(
             tool_calls_vec.push((tc.name.clone(), args));
         }
 
-        let results = crate::tool_runtime::batch::execute_tool_batch(
+        let results = crate::tool_runtime::middleware::execute_tool_batch_audited(
             tool_calls_vec,
             &tool_registry,
             config.tools.worker_pool.tool_timeout_ms,
+            &middleware,
+            &audit_ctx,
         )
         .await;
 
@@ -299,7 +458,7 @@ async fn run_loop(
                     serde_json::to_value(&crate::store::collections::TraceDoc {
                         id: uuid::Uuid::new_v4().to_string(),
                         agent_id: opts.agent_id.clone(),
-                        run_id: String::new(),
+                        run_id: audit_ctx.run_id.clone(),
                         thread_id: opts.thread_id.clone(),
                         tool_name: result.tool_name.clone(),
                         tool_args: serde_json::Value::Null,
@@ -338,4 +497,86 @@ async fn run_loop(
         .await;
 
     Ok(())
+}
+/// Rebuild a thread's conversation from `COL_MESSAGES` for `resume`. Returns the
+/// user/assistant turns in chronological order. Tool-call turns are not persisted
+/// there, so the reconstructed history is a clean alternating conversation with
+/// no dangling tool_use/tool_result blocks.
+async fn load_thread_history(
+    db: &crate::store::HiveDb,
+    thread_id: &str,
+) -> Vec<hivecyber_providers::Message> {
+    use hivecyber_providers::{Content, Message};
+
+    let mut docs: Vec<serde_json::Value> = db
+        .list(crate::store::collections::COL_MESSAGES)
+        .await
+        .into_iter()
+        .map(|(_, v)| v)
+        .filter(|v| v.get("thread_id").and_then(|t| t.as_str()) == Some(thread_id))
+        .collect();
+
+    docs.sort_by(|a, b| {
+        let ka = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let kb = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        ka.cmp(kb)
+    });
+
+    docs.into_iter()
+        .filter_map(|v| {
+            let role = v.get("role").and_then(|r| r.as_str())?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            Some(Message { role: role.to_string(), content: Content::Text(content) })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod rehydrate_tests {
+    use super::load_thread_history;
+    use crate::store::HiveDb;
+    use crate::store::collections::COL_MESSAGES;
+
+    async fn tmp_db() -> HiveDb {
+        let dir = std::path::PathBuf::from(format!("/tmp/hc_rehy_{}", uuid::Uuid::new_v4()));
+        HiveDb::open(&dir).await.unwrap()
+    }
+
+    async fn put(db: &HiveDb, thread: &str, role: &str, content: &str, ts: &str) {
+        db.insert(
+            COL_MESSAGES,
+            &uuid::Uuid::new_v4().to_string(),
+            serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "thread_id": thread,
+                "role": role,
+                "content": content,
+                "created_at": ts,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rehydrates_thread_in_order_and_filters() {
+        let db = tmp_db().await;
+        // Out-of-insert-order timestamps to prove chronological sorting.
+        put(&db, "t1", "assistant", "segundo (assistant)", "2026-01-01T00:00:02Z").await;
+        put(&db, "t1", "user", "primero (user)", "2026-01-01T00:00:01Z").await;
+        put(&db, "t1", "tool", "no debe aparecer", "2026-01-01T00:00:03Z").await;
+        put(&db, "other", "user", "otro hilo", "2026-01-01T00:00:01Z").await;
+
+        let hist = load_thread_history(&db, "t1").await;
+        assert_eq!(hist.len(), 2, "tool role skipped, other thread excluded");
+        assert_eq!(hist[0].role, "user");
+        assert_eq!(hist[1].role, "assistant");
+        match &hist[0].content {
+            hivecyber_providers::Content::Text(t) => assert!(t.contains("primero")),
+            _ => panic!("expected text"),
+        }
+    }
 }

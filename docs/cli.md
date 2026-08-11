@@ -23,7 +23,8 @@ Commands:
   chat      REPL interactivo con el coordinador
   run       Invocacion unica (no-interactiva)
   agent     Gestion de agentes
-  skills    Listar/ver skills
+  provider  Configurar providers, API keys (cifradas) y modelos
+  skills    Listar/ver/instalar skills
   mcp       Gestion de MCP servers
   config    Ver/editar config
   logs      Tail de traces
@@ -36,6 +37,12 @@ Commands:
 Options:
   --unsafe-mode               Activa modo inseguro (requerido para exploit)
   --allowlist-hosts <FILE>    Archivo con allowlist de hosts (CIDR o exactos)
+  --engagement-policy <FILE>  EngagementPolicy JSON (exclusiones, actividades prohibidas,
+                               aprobacion humana) — si se pasa, prevalece sobre --allowlist-hosts
+  --allow-cli-exec             Habilita la tool cli_exec (desactivada por defecto,
+                               requiere ademas --unsafe-mode)
+  --approve-human <CATEGORY>   Marca una categoria de EngagementPolicy como aprobada
+                               por humano (repetible)
 ```
 
 ### chat
@@ -70,11 +77,43 @@ Como `chat` pero una sola invocacion, no interactiva.
 hivecyber agent list                  # tabla: id, name, role, enabled, description
 hivecyber agent show <id>             # JSON completo del agente
 hivecyber agent enable <id>           # re-activa agente pausado/disabled
+hivecyber agent disable <id>          # desactiva un agente
+hivecyber agent set-model <id> <model>      # fija el modelo (vacio "" → default global)
+hivecyber agent set-provider <id> <provider># fija el provider del agente
 ```
 
 Seed automatico en primer `chat` o `run`:
 - 1 coordinator `caelum` (system_prompt con instrucciones de delegacion)
 - 8 workers con tool_allowlist, default_acceptance, workspace_scope, model_override (algunos)
+
+### provider
+
+```bash
+# Guarda la API key (cifrada AES-256-GCM) + base-url/modelo opcionales
+hivecyber provider set hiveagents --api-key <KEY> --model Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+hivecyber provider set openai --base-url https://proxy.local/v1
+
+hivecyber provider list               # tabla: provider, key set?, default, modelo
+hivecyber provider show <id>          # config de un provider (key enmascarada)
+hivecyber provider default <id> [--model <m>]   # provider/modelo por defecto
+```
+
+Las keys se cifran con una master key en `<home>/.master.key` (0600, autogenerada)
+o `HIVECYBER_MASTER_KEY`. Precedencia de resolución: variable de entorno del
+provider → secret store cifrado. Una vez configurado, `run`/`chat` funcionan **sin
+exportar env vars**. Los defaults (`provider default`) se guardan en la colección
+`settings` y se aplican al arrancar.
+
+### models
+
+```bash
+hivecyber models                      # catálogo completo: provider, model, ctx, costo USD/1M
+hivecyber models --provider hiveagents
+```
+
+Espejo del catálogo de Hive (89 modelos LLM) sembrado en `COL_MODELS` con `context_window`
+e `input/output_per_1m`. El **context window por modelo** determina el presupuesto de
+compaction del loop (ver `docs/agent-loop.md`); el costo alimenta reportes de gasto.
 
 ### skills
 
@@ -82,18 +121,33 @@ Seed automatico en primer `chat` o `run`:
 hivecyber skills list                 # tabla: name, category, version, description
 hivecyber skills show <name>          # JSON completo
 hivecyber skills reload               # recarga del disco
+hivecyber skills add <path>           # instala una skill (copia el dir con SKILL.md
+                                       # al managed dir) y recarga
 ```
 
-Carga desde `skills/bundled/` (relativo al crate CLI en dev, pendiente absoluto en release) + `~/.hivecyber/skills/` (managed).
+Carga desde `skills/bundled/` (relativo al crate CLI en dev) + `<home>/skills/` (managed).
 
 ### mcp
 
 ```bash
+# stdio
+hivecyber mcp add fs --transport stdio --command npx \
+  --arg -y --arg @modelcontextprotocol/server-filesystem --arg /tmp
+# sse / streamable-http
+hivecyber mcp add remote --transport sse --url https://api.example.com/mcp \
+  --header "Authorization=Bearer token123"
+
 hivecyber mcp list                    # servers registrados + status
-hivecyber mcp connect <name>          # intenta conectar
+hivecyber mcp connect <name>          # conecta y lista sus tools
+hivecyber mcp tools [name]            # tools de un server (o de todos)
+hivecyber mcp call <name> <tool> '<json>'
+hivecyber mcp disconnect <name>
+hivecyber mcp remove <name>
 ```
 
-Pendiente: Registrar servers desde config al iniciar `chat`.
+Los servers se persisten en la colección `mcp_servers` y se conectan
+automáticamente al iniciar `chat`/`run` (sus tools se exponen al agente vía
+`McpToolProxy`). Ver `docs/mcp.md`.
 
 ### config
 
@@ -101,12 +155,16 @@ Pendiente: Registrar servers desde config al iniciar `chat`.
 hivecyber config show                 # JSON completo de la config
 ```
 
-Config via env vars:
+Config via env vars (prevalecen sobre `settings` persistidos):
 - `HIVECYBER_HOME` — directorio base (default `~/.hivecyber/` o `~/.local/share/hivecyber/`)
 - `HIVECYBER_HOST` / `HIVECYBER_PORT` — pendiente de usar (no hay gateway)
-- `HIVECYBER_DEFAULT_PROVIDER` — pendiente wire
+- `HIVECYBER_DEFAULT_PROVIDER` — provider por defecto (o usa `provider default`)
+- `HIVECYBER_DEFAULT_MODEL` — modelo por defecto (vacío → default del provider)
+- `HIVECYBER_MASTER_KEY` — master key (base64/hex de 32 bytes) para el secret store;
+  si falta, se genera `<home>/.master.key` (0600)
 - `HIVECYBER_MCP_ENABLED` — true/false
-- API keys por provider: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, etc (ver `.env.example`)
+- API keys por provider: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, etc
+  (o guárdalas cifradas con `provider set`; ver `.env.example`)
 
 ### logs
 
@@ -126,10 +184,11 @@ hivecyber resume <run_id>
 ```
 
 Retoma un run durable interrumpido:
-- Lee el `RunDoc` de HiveDB
-- Extrae `agent_id` y `thread_id`
-- Spawnea nuevo `AgentLoop::run()` con mensaje "Continua la operacion..."
-- Pendiente: reconstruir messages desde HiveDB en lugar de empezar de cero
+- Lee el `RunDoc` de HiveDB, extrae `agent_id` y `thread_id`
+- **Rehidrata el historial** del hilo desde `COL_MESSAGES` (turnos user/assistant en orden
+  cronológico; los turnos con tools no se persisten, así que no hay `tool_result` huérfanos)
+  y continúa con `AgentLoop::run()` (`rehydrate: true`)
+- Pendiente: checkpoints/estado del run para reanudar mitad-de-turno con tools en vuelo
 
 ### doctor
 
@@ -186,6 +245,9 @@ hivecyber version
 |---|---|
 | `--unsafe-mode` | Habilita tools peligrosas (hydra, msf, mimikatz, cme) — default `false` |
 | `--allowlist-hosts <FILE>` | Carga hosts/CIDRs desde archivo — required para exploit |
+| `--engagement-policy <FILE>` | EngagementPolicy JSON (superset del allowlist: exclusiones, actividades prohibidas, aprobacion humana) — prevalece sobre `--allowlist-hosts` si ambos se pasan |
+| `--allow-cli-exec` | Habilita la tool `cli_exec`, desactivada por defecto — independiente de `--unsafe-mode` |
+| `--approve-human <CATEGORY>` | Registra aprobacion humana para una `ApprovalCategory` de EngagementPolicy (repetible) |
 
 Formato del archivo:
 ```

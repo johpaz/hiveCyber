@@ -1,11 +1,50 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+mod sandbox;
+
+// Wire-format snapshot of the caller's SecurityContext. A freshly spawned
+// worker process has none of the caller's state (--unsafe-mode,
+// --allowlist-hosts, engagement policy) — without this, every exploit tool
+// routed here would see SecurityContext::default() and reject itself
+// regardless of what the operator actually authorized.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WorkerSecurityCtx {
+    #[serde(default)]
+    unsafe_mode: bool,
+    #[serde(default)]
+    allowlist_hosts: Vec<String>,
+    #[serde(default)]
+    operator_id: String,
+    #[serde(default)]
+    allow_cli_exec: bool,
+    #[serde(default)]
+    engagement_policy: Option<hivecyber_tools::EngagementPolicy>,
+}
+
+impl WorkerSecurityCtx {
+    fn into_security_context(self) -> hivecyber_tools::SecurityContext {
+        hivecyber_tools::SecurityContext {
+            unsafe_mode: self.unsafe_mode,
+            allowlist_hosts: self.allowlist_hosts,
+            operator_id: self.operator_id,
+            engagement_policy: self.engagement_policy.map(Arc::new),
+            human_approvals: Arc::new(Mutex::new(HashSet::new())),
+            allow_cli_exec: self.allow_cli_exec,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct WorkerRequest {
     job_id: String,
     tool_name: String,
     args: serde_json::Value,
+    #[serde(default)]
+    security: WorkerSecurityCtx,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,25 +55,32 @@ struct WorkerResponse {
     error: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("hivecyber-worker starting (sandboxed)");
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = apply_sandbox() {
-            tracing::warn!("sandbox setup partial: {}", e);
-        }
+    // Sandboxing must run before any other OS thread exists: unshare(CLONE_NEWUSER)
+    // only succeeds on a single-threaded process, and #[tokio::main] would have
+    // already spawned the runtime's worker threads before our async body ran.
+    // So we build the tokio runtime by hand, after the sandbox is in place.
+    if let Err(e) = sandbox::apply_sandbox() {
+        tracing::error!("sandbox setup failed — refusing to run: {}", e);
+        std::process::exit(2);
     }
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
 
-    let registry = hivecyber_tools::ToolRegistry::create_all();
-    tracing::info!("worker ready with {} tools, reading from stdin", registry.names().len());
+    tracing::info!("worker ready, reading from stdin");
 
     while let Ok(Some(line)) = lines.next_line().await {
         let req: WorkerRequest = match serde_json::from_str(&line) {
@@ -53,6 +99,12 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        // Rebuild the registry per request from the security snapshot the
+        // caller sent — each call must explicitly carry its own authorized
+        // posture rather than trusting ambient process state.
+        let registry = hivecyber_tools::ToolRegistry::create_with_security(Arc::new(
+            req.security.clone().into_security_context(),
+        ));
         let result = execute_tool(&registry, &req.tool_name, &req.args).await;
 
         let resp = match result {
@@ -89,21 +141,4 @@ async fn execute_tool(
         .clone();
 
     tool.execute(args.clone()).await
-}
-
-#[cfg(target_os = "linux")]
-fn apply_sandbox() -> anyhow::Result<()> {
-    tracing::info!("applying Linux sandbox (seccomp + capabilities drop)");
-
-    use caps::CapSet;
-    use caps::Capability;
-
-    if caps::has_cap(None, CapSet::Effective, Capability::CAP_SYS_ADMIN).unwrap_or(false) {
-        if let Err(e) = caps::clear(None, CapSet::Effective) {
-            tracing::warn!("failed to drop capabilities: {}", e);
-        }
-    }
-
-    tracing::info!("sandbox applied (basic capabilities drop)");
-    Ok(())
 }

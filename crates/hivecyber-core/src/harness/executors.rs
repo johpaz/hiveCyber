@@ -6,6 +6,8 @@ use tracing::info;
 
 use crate::store::HiveDb;
 use crate::store::collections::{COL_TASKS, TaskDoc};
+use crate::tool_runtime::batch::ToolBatchResult;
+use crate::tool_runtime::middleware::{AuditCtx, ToolMiddleware, execute_tool_batch_audited};
 use crate::agent::acceptance::{run_acceptance_checks, verdict, CheckStatus};
 use crate::config::Config;
 
@@ -26,16 +28,22 @@ pub struct WorkerTaskExecutor {
     db: HiveDb,
     config: Config,
     security: Arc<hivecyber_tools::SecurityContext>,
+    mcp: Option<crate::agent::mcp_integration::SharedMcp>,
 }
 
 impl WorkerTaskExecutor {
     pub fn new(db: HiveDb, config: Config) -> Self {
         let security = Arc::new(hivecyber_tools::SecurityContext::default());
-        WorkerTaskExecutor { db, config, security }
+        WorkerTaskExecutor { db, config, security, mcp: None }
     }
 
     pub fn with_security(mut self, security: Arc<hivecyber_tools::SecurityContext>) -> Self {
         self.security = security;
+        self
+    }
+
+    pub fn with_mcp(mut self, mcp: Option<crate::agent::mcp_integration::SharedMcp>) -> Self {
+        self.mcp = mcp;
         self
     }
 }
@@ -80,18 +88,39 @@ impl JobExecutor for WorkerTaskExecutor {
             anyhow::bail!("worker agent {} is disabled", worker_id);
         }
 
-        let system_prompt = agent_val.get("system_prompt").and_then(|s| s.as_str()).unwrap_or("");
+        let mut system_prompt = agent_val
+            .get("system_prompt")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Surface the skills most relevant to this task (BM25 skill-selector),
+        // so the worker gets its playbooks without shipping the whole set.
+        let skills_ctx =
+            crate::agent::routing_context::build_skill_context(&self.db, task_description).await;
+        if !skills_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&skills_ctx);
+        }
         let provider = agent_val.get("provider_id").and_then(|p| p.as_str())
             .unwrap_or(&self.config.models.default_provider);
+        // model_id from the agent, else the global config default, else empty —
+        // an empty model makes the provider registry use its own default_model,
+        // so we never carry a stale hardcoded per-provider model map here.
         let model = agent_val.get("model_id").and_then(|m| m.as_str())
-            .unwrap_or(default_model_for(provider));
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.config.models.default_model);
 
         let tool_allowlist: Vec<String> = agent_val
             .get("tool_allowlist_json")
             .and_then(|t| serde_json::from_value(t.clone()).ok())
             .unwrap_or_default();
 
-        let tool_registry = hivecyber_tools::ToolRegistry::create_with_security(self.security.clone());
+        let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(self.security.clone());
+        // MCP tools are exposed to workers too; the allowlist below still gates
+        // which ones this specific worker may call.
+        if let Some(mcp) = self.mcp.as_ref() {
+            crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp).await;
+        }
         let active_tools: Vec<hivecyber_providers::ToolDef> = if tool_allowlist.is_empty() {
             tool_registry.all().iter().map(|t| hivecyber_providers::ToolDef {
                 name: t.name().into(),
@@ -109,9 +138,13 @@ impl JobExecutor for WorkerTaskExecutor {
             }).collect()
         };
 
-        let api_key = hivecyber_providers::ProviderRegistry::get_default_api_key(provider)
-            .unwrap_or_default();
-        let registry = hivecyber_providers::ProviderRegistry::new();
+        let api_key = crate::security::crypto::resolve_api_key(
+            &self.db,
+            &self.config.home_dir,
+            provider,
+        )
+        .await;
+        let registry = crate::settings::registry_for(&self.db).await;
         let client = registry.get(provider, model, &api_key)
             .ok_or_else(|| anyhow::anyhow!("provider not configured: {}", provider))?;
 
@@ -158,11 +191,20 @@ impl JobExecutor for WorkerTaskExecutor {
                 .map(|tc| (tc.name.clone(), tc.arguments.clone()))
                 .collect();
 
-            let results = crate::tool_runtime::batch::execute_tool_batch(
+            let middleware = ToolMiddleware::new(self.db.clone(), self.security.clone());
+            let audit_ctx = AuditCtx {
+                worker: worker_id.to_string(),
+                run_id: job_id.to_string(),
+                operator_id: self.security.operator_id.clone(),
+            };
+            let results = execute_tool_batch_audited(
                 tool_calls_vec,
                 &tool_registry,
                 self.config.tools.worker_pool.tool_timeout_ms,
-            ).await;
+                &middleware,
+                &audit_ctx,
+            )
+            .await;
 
             for (tool_call, result) in tool_calls.iter().zip(results.iter()) {
                 let result_str = if result.success {
@@ -231,7 +273,7 @@ impl JobExecutor for WorkerTaskExecutor {
                     }),
                 })
             }
-            CheckStatus::Passed | CheckStatus::Unchecked => {
+            CheckStatus::Passed => {
                 crate::security::policies::increment_helpful(&self.db, worker_id).await?;
                 let mut task_val = self.db.get(COL_TASKS, task_id).await.unwrap_or_default();
                 if let Some(obj) = task_val.as_object_mut() {
@@ -257,18 +299,36 @@ impl JobExecutor for WorkerTaskExecutor {
                     }),
                 })
             }
+            CheckStatus::Pending | CheckStatus::Unchecked => {
+                let mut task_val = self.db.get(COL_TASKS, task_id).await.unwrap_or_default();
+                let acceptance_status = match status {
+                    CheckStatus::Pending => "acceptance_pending",
+                    _ => "acceptance_unchecked",
+                };
+                if let Some(obj) = task_val.as_object_mut() {
+                    obj.insert("status".into(), acceptance_status.into());
+                    obj.insert("delivery".into(), serde_json::json!({
+                        "content": delivery_text,
+                        "evidence": evidence,
+                        "checks": checks_json,
+                    }));
+                    obj.insert("updated_at".into(), chrono::Utc::now().to_rfc3339().into());
+                }
+                self.db.insert(COL_TASKS, task_id, task_val).await?;
+                Ok(ExecutorResult {
+                    ok: false,
+                    retryable: false,
+                    result: serde_json::json!({
+                        "status": acceptance_status,
+                        "delivery": delivery_text,
+                        "evidence": evidence,
+                        "checks": checks_json,
+                        "tool_calls": tool_call_count,
+                        "acceptance": "no verificado — no se acredita como util",
+                    }),
+                })
+            }
         }
     }
 }
 
-fn default_model_for(provider: &str) -> &str {
-    match provider {
-        "anthropic" => "claude-sonnet-4-20250514",
-        "openai" => "gpt-4o",
-        "gemini" => "gemini-3.6-flash",
-        "ollama" => "llama3.2",
-        "groq" => "llama-3.3-70b-versatile",
-        "opencode_go" => "kimi-k2.6",
-        _ => "gpt-4o",
-    }
-}

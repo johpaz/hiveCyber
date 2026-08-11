@@ -6,12 +6,20 @@ hiveCyber aplica politicas de seguridad **mas estrictas que Hive** porque las to
 
 ## Modo dual default-OFF
 
-Las tools con `isolation = Sandbox` (exploit_operator, web_pentester) Y las comandos peligrosos en `cli_exec` no ejecutan por defecto. Requieren flags explicitos:
+Las tools con `isolation = Sandbox` (metasploit_rpc, hydra, crackmapexec, mimikatz) Y `cli_exec` no ejecutan por defecto. Requieren flags explicitos:
 
 ```bash
 hivecyber chat --unsafe-mode --allowlist-hosts /path/targets.txt
 hivecyber run "Exploita 10.0.0.5 con EternalBlue" --unsafe-mode --allowlist-hosts targets.txt
 ```
+
+`cli_exec` tiene un segundo interruptor independiente: incluso con `--unsafe-mode` activo, la tool en si esta desactivada hasta pasar `--allow-cli-exec`:
+
+```bash
+hivecyber run "..." --unsafe-mode --allowlist-hosts targets.txt --allow-cli-exec
+```
+
+`--engagement-policy <file.json>` reemplaza el allowlist plano por una `EngagementPolicy` (ver mas abajo) con exclusiones, actividades prohibidas y categorias que requieren aprobacion humana; si se pasa, tiene prioridad sobre `--allowlist-hosts`.
 
 ### CliExec dangerous detection (`tools/src/base/mod.rs`)
 
@@ -102,6 +110,53 @@ Despues se propaga a:
 - `ToolRegistry::create_with_security(security)` para construir todas las tools con este contexto
 - `WorkerTaskExecutor::with_security(security)` para que los workers respeten el mismo contexto
 - `DispatchLoop::with_security(security)`
+
+## EngagementPolicy (`tools/src/engagement.rs`)
+
+Formato mas expresivo que el allowlist plano, cargado con `--engagement-policy <file.json>`:
+
+```json
+{
+  "program": "cliente-acme-q3-2026",
+  "targets": [
+    { "host": "10.0.0.0/24", "paths": ["/**"], "methods": ["GET", "POST"] },
+    { "host": "app.example.com", "paths": ["/api/**"], "methods": ["GET"], "only_own_accounts": true }
+  ],
+  "excluded": ["10.0.0.1", "admin.example.com"],
+  "prohibited": ["denial_of_service", "social_engineering", "destructive_test"],
+  "require_human_approval": ["exploit", "credential_use"]
+}
+```
+
+- `targets[].host` acepta host exacto, CIDR (`10.0.0.0/24`, `fe80::/10`) o subdominio (matching por sufijo seguro: `example.com` cubre `api.example.com` pero nunca `evil-example.com`).
+- `excluded` se evalua antes que `targets` y siempre gana — sirve para excluir un host/CIDR puntual dentro de un rango mas amplio.
+- `prohibited` / `require_human_approval` son chequeados por las tools de exploit antes de ejecutar (`is_prohibited`, `requires_approval`).
+- Toda normalizacion de host (scheme, userinfo, puerto, mayusculas, IPv4 numerico/hex) pasa por `normalize_host()` — usado tanto por `EngagementPolicy` como por el allowlist plano legado, para que ambos caminos vean el mismo host normalizado.
+
+## ToolMiddleware: auditoria obligatoria (`core/src/tool_runtime/middleware.rs`)
+
+Toda ejecucion de tool pasa por `ToolMiddleware::execute`, sin excepcion:
+
+1. Ejecuta la tool (in-process, o enrutada al worker sandboxed si `isolation() == Sandbox` — ver abajo).
+2. Escribe SIEMPRE una entrada en el audit log (`log_audit`), exitosa o fallida.
+3. **Fail-closed**: si el propio audit log no puede escribirse (DB caida, disco lleno), la operacion se reporta como fallida — nunca se deja pasar una ejecucion sin auditar silenciosamente.
+
+`AuditCtx { worker, run_id, operator_id }` identifica cada llamada; el hash chain (`security/audit.rs`) sigue igual que antes.
+
+## Sandbox del worker (`hivecyber-worker/src/sandbox.rs`)
+
+Las tools con `isolation() == Sandbox` (metasploit_rpc, hydra, crackmapexec, mimikatz) nunca se ejecutan dentro del proceso principal: `ToolMiddleware` las despacha a un subproceso `hivecyber-worker` por stdio, junto con un snapshot serializado del `SecurityContext` del llamador (unsafe_mode, allowlist, engagement policy, allow_cli_exec) — el worker reconstruye su `ToolRegistry` con ese contexto exacto en cada request, no con uno por defecto.
+
+El worker aplica, en orden, antes de ejecutar nada (best-effort, Linux):
+
+1. `PR_SET_NO_NEW_PRIVS`
+2. rlimits: CPU (600s), FSIZE (1GB), NOFILE (256), RSS (1GB), CORE (0), y NPROC calculado dinamicamente (uso actual del UID + margen — un valor fijo bajo cuelga el proceso en cualquier maquina real, ver comentarios en `apply_rlimits`)
+3. Drop de capabilities (todos los sets)
+4. Namespaces de usuario + mount (`unshare(CLONE_NEWUSER|CLONE_NEWNS)`). **No** se usan `CLONE_NEWPID` (incompatible con el runtime multi-hilo de tokio) ni `CLONE_NEWNET` (dejaria sin red a las tools que necesitan alcanzar el target)
+5. Filtro seccomp BPF: allowlist de ~140 syscalls necesarias para I/O/red/threads normales; ~20 syscalls de alto riesgo (`ptrace`, `mount`, `bpf`, `kexec_load`, `keyctl`, ...) terminan el proceso con `SECCOMP_RET_KILL_PROCESS`; cualquier otra syscall retorna `EPERM`
+6. Landlock (best-effort; hoy solo detecta soporte, no restringe rutas — pendiente)
+
+El binario debe estar en `PATH` o apuntado por `HIVECYBER_WORKER_BIN`; si no se encuentra, la tool falla explicitamente en vez de ejecutar sin sandbox.
 
 ## Auto-pause / auto-disable (`core/src/security/policies.rs`)
 

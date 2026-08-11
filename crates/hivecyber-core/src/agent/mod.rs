@@ -1,11 +1,20 @@
 pub mod loop_runner;
 pub mod context;
 pub mod llm_client;
+pub mod capability_search;
+pub mod catalog_selector;
+pub mod tool_selector;
 pub mod catalog;
 pub mod run_store;
 pub mod stuck;
 pub mod delegation;
 pub mod delegation_backend;
 pub mod acceptance;
+pub mod mcp_integration;
+pub mod memory_backend;
+pub mod skill_selector;
+pub mod routing_context;
+pub mod compaction;
+pub mod models_catalog;
 
 pub use loop_runner::AgentLoop;

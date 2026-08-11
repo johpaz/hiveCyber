@@ -20,6 +20,18 @@ pub trait TaskDelegateBackend: Send + Sync {
         turn_id: &str,
         thread_id: &str,
     ) -> Result<(String, String)>;
+
+    /// Return the current state of a delegated task, or `None` if it does not
+    /// exist. Implementations read the task document from the store.
+    async fn get_task_status(&self, task_id: &str) -> Result<Option<Value>>;
+
+    /// List delegated tasks (most recent first), optionally filtered by status,
+    /// capped at `limit`. Returns projected summaries (not full deliveries).
+    async fn list_tasks(&self, status: Option<String>, limit: usize) -> Result<Vec<Value>>;
+
+    /// Re-delegate an existing task to the same worker, appending `notes` as
+    /// revision guidance and re-queuing it. Returns a summary of the new job.
+    async fn revise_task(&self, task_id: &str, notes: &str) -> Result<Value>;
 }
 
 #[async_trait]
@@ -117,10 +129,101 @@ impl Tool for TaskStatus {
         }
     }
 
-    async fn execute(&self, _params: Value) -> Result<Value> {
-        Ok(json!({
-            "status": "not_implemented",
-            "message": "task_status requires DB access — use agent system prompt to track"
-        }))
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let task_id = params
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("task_id required"))?;
+
+        match self.db.get_task_status(task_id).await? {
+            Some(task) => Ok(task),
+            None => Ok(json!({
+                "task_id": task_id,
+                "status": "not_found",
+                "message": "no delegated task with that id",
+            })),
+        }
+    }
+}
+
+pub struct TaskList {
+    pub db: Arc<dyn TaskDelegateBackend>,
+}
+
+#[async_trait]
+impl Tool for TaskList {
+    fn name(&self) -> &str {
+        "task_list"
+    }
+    fn description(&self) -> &str {
+        "Lista las tareas delegadas (mas recientes primero), con su estado. Filtra por status opcional (pending/running/completed/failed/blocked)."
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Base
+    }
+    fn parameters(&self) -> ToolSchema {
+        let mut props = HashMap::new();
+        props.insert("status".into(), json!({"type": "string", "description": "Filtro opcional por estado", "enum": ["pending", "running", "completed", "failed", "blocked"]}));
+        props.insert("limit".into(), json!({"type": "integer", "default": 20}));
+        ToolSchema {
+            schema_type: "object".into(),
+            properties: props,
+            required: None,
+        }
+    }
+
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let status = params
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+
+        let tasks = self.db.list_tasks(status, limit).await?;
+        Ok(json!({ "count": tasks.len(), "tasks": tasks }))
+    }
+}
+
+pub struct TaskRevise {
+    pub db: Arc<dyn TaskDelegateBackend>,
+}
+
+#[async_trait]
+impl Tool for TaskRevise {
+    fn name(&self) -> &str {
+        "task_revise"
+    }
+    fn description(&self) -> &str {
+        "Re-delega una tarea existente al mismo worker, agregando notas de revision. Util cuando una entrega no paso los acceptance checks."
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Base
+    }
+    fn parameters(&self) -> ToolSchema {
+        let mut props = HashMap::new();
+        props.insert("task_id".into(), json!({"type": "string"}));
+        props.insert("notes".into(), json!({"type": "string", "description": "Que corregir o mejorar en la nueva iteracion"}));
+        ToolSchema {
+            schema_type: "object".into(),
+            properties: props,
+            required: Some(vec!["task_id".into(), "notes".into()]),
+        }
+    }
+
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let task_id = params
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("task_id required"))?;
+        let notes = params
+            .get("notes")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("notes required"))?;
+
+        self.db.revise_task(task_id, notes).await
     }
 }

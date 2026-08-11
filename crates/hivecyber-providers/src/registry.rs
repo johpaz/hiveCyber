@@ -21,7 +21,7 @@ impl ProviderRegistry {
             ProviderConfig {
                 id: "anthropic".into(),
                 base_url: "https://api.anthropic.com".into(),
-                default_model: "claude-sonnet-4-20250514".into(),
+                default_model: "claude-sonnet-5".into(),
                 api_key_env: "ANTHROPIC_API_KEY".into(),
                 custom: true,
             },
@@ -48,7 +48,7 @@ impl ProviderRegistry {
             },
             ProviderConfig {
                 id: "groq".into(),
-                base_url: "https://api.groq.com/openai".into(),
+                base_url: "https://api.groq.com/openai/v1".into(),
                 default_model: "llama-3.3-70b-versatile".into(),
                 api_key_env: "GROQ_API_KEY".into(),
                 custom: false,
@@ -76,8 +76,8 @@ impl ProviderRegistry {
             },
             ProviderConfig {
                 id: "kimi".into(),
-                base_url: "https://api.moonshot.cn/v1".into(),
-                default_model: "moonshot-v1-128k".into(),
+                base_url: "https://api.moonshot.ai/v1".into(),
+                default_model: "kimi-k2.5".into(),
                 api_key_env: "KIMI_API_KEY".into(),
                 custom: false,
             },
@@ -90,20 +90,20 @@ impl ProviderRegistry {
             },
             ProviderConfig {
                 id: "qwen".into(),
-                base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
+                base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into(),
                 default_model: "qwen-max".into(),
                 api_key_env: "QWEN_API_KEY".into(),
                 custom: false,
             },
             ProviderConfig {
                 id: "minimax".into(),
-                base_url: "https://api.minimax.chat/v1".into(),
+                base_url: "https://api.minimaxi.com/v1".into(),
                 default_model: "abab6.5s-chat".into(),
                 api_key_env: "MINIMAX_API_KEY".into(),
                 custom: false,
             },
             ProviderConfig {
-                id: "zai".into(),
+                id: "z-ai".into(),
                 base_url: "https://api.z.ai/api/paas/v4".into(),
                 default_model: "glm-4-plus".into(),
                 api_key_env: "ZAI_API_KEY".into(),
@@ -111,21 +111,21 @@ impl ProviderRegistry {
             },
             ProviderConfig {
                 id: "modelscope".into(),
-                base_url: "https://api-inference.modelscope.cn/v1".into(),
+                base_url: "https://api-inference.modelscope.ai/v1".into(),
                 default_model: "Qwen/Qwen2.5-72B-Instruct".into(),
                 api_key_env: "MODELSCOPE_API_KEY".into(),
                 custom: false,
             },
             ProviderConfig {
-                id: "opencode_go".into(),
-                base_url: "https://opencode.ai/zen/go".into(),
+                id: "opencode-go".into(),
+                base_url: "https://opencode.ai/zen/go/v1".into(),
                 default_model: "kimi-k2.6".into(),
                 api_key_env: "OPENCODE_GO_API_KEY".into(),
                 custom: false,
             },
             ProviderConfig {
                 id: "hiveagents".into(),
-                base_url: "https://api.hiveagents.ai/v1".into(),
+                base_url: "https://llm.hiveagents.io/v1".into(),
                 default_model: "hive-max".into(),
                 api_key_env: "HIVEAGENTS_API_KEY".into(),
                 custom: false,
@@ -137,6 +137,37 @@ impl ProviderRegistry {
 
     pub fn list_providers(&self) -> Vec<String> {
         self.configs.iter().map(|c| c.id.clone()).collect()
+    }
+
+    /// Override a provider's base URL and/or default model at runtime (from
+    /// persisted settings written by `provider set`). Unknown provider ids and
+    /// `None` fields are ignored, so callers can pass partial overrides.
+    pub fn apply_override(
+        &mut self,
+        provider_id: &str,
+        base_url: Option<String>,
+        default_model: Option<String>,
+    ) {
+        if let Some(cfg) = self.configs.iter_mut().find(|c| c.id == provider_id) {
+            if let Some(url) = base_url {
+                if !url.is_empty() {
+                    cfg.base_url = url;
+                }
+            }
+            if let Some(model) = default_model {
+                if !model.is_empty() {
+                    cfg.default_model = model;
+                }
+            }
+        }
+    }
+
+    /// The default model id configured for a provider (built-in or overridden).
+    pub fn default_model_for(&self, provider_id: &str) -> Option<String> {
+        self.configs
+            .iter()
+            .find(|c| c.id == provider_id)
+            .map(|c| c.default_model.clone())
     }
 
     pub fn get(
@@ -193,9 +224,9 @@ impl ProviderRegistry {
             ("nvidia", "NVIDIA_API_KEY"),
             ("qwen", "QWEN_API_KEY"),
             ("minimax", "MINIMAX_API_KEY"),
-            ("zai", "ZAI_API_KEY"),
+            ("z-ai", "ZAI_API_KEY"),
             ("modelscope", "MODELSCOPE_API_KEY"),
-            ("opencode_go", "OPENCODE_GO_API_KEY"),
+            ("opencode-go", "OPENCODE_GO_API_KEY"),
             ("hiveagents", "HIVEAGENTS_API_KEY"),
         ]
         .into_iter()

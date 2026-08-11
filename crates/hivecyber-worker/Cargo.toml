@@ -21,3 +21,4 @@ hivecyber-tools = { path = "../hivecyber-tools" }
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["process", "sched", "mount", "signal"] }
 caps = "0.5"
+libc = { workspace = true }

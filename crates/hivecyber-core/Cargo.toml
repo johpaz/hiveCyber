@@ -23,6 +23,11 @@ hivecyber-providers = { path = "../hivecyber-providers" }
 hivecyber-tools = { path = "../hivecyber-tools" }
 hivecyber-mcp = { path = "../hivecyber-mcp" }
 hivecyber-skills = { path = "../hivecyber-skills" }
+tantivy = "0.22"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
 
 [dev-dependencies]
 uuid = { workspace = true }
+tempfile = "3"

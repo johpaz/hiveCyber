@@ -19,3 +19,10 @@ chrono = { workspace = true }
 walkdir = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+# office tools (report_writer): read/write docx/xlsx/pdf
+calamine = "0.26"
+docx-rs = "0.4"
+rust_xlsxwriter = "0.79"
+zip = "2.2"
+printpdf = "0.7"
+pdf-extract = "0.7"

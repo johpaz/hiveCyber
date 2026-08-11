@@ -167,4 +167,4 @@ OPENAI_API_KEY=sk-... hivecyber chat   # pendiente wire default_provider config
 GROQ_API_KEY=gsk-... hivecyber chat     # pendiente wire default_provider config
 ```
 
-En MVP, `default_provider = "anthropic"` hardcoded en config. Para cambiar, setear `HIVECYBER_DEFAULT_PROVIDER` (pendiente wire).
+`default_provider` y `default_model` son configurables via `HIVECYBER_DEFAULT_PROVIDER` / `HIVECYBER_DEFAULT_MODEL` (o `config.models`). Base URLs y modelos alineados con Hive; default de producción `hiveagents`.

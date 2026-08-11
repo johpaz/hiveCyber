@@ -5,12 +5,17 @@ use std::sync::Arc;
 
 use crate::base;
 use crate::recon;
+use crate::web;
+use crate::engagement::EngagementPolicy;
 
 #[derive(Debug, Clone, Default)]
 pub struct SecurityContext {
     pub unsafe_mode: bool,
     pub allowlist_hosts: Vec<String>,
     pub operator_id: String,
+    pub engagement_policy: Option<Arc<EngagementPolicy>>,
+    pub human_approvals: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pub allow_cli_exec: bool,
 }
 
 impl SecurityContext {
@@ -21,6 +26,20 @@ impl SecurityContext {
                 target
             ));
         }
+        if let Some(ref policy) = self.engagement_policy {
+            let outcome = policy.target_allowed(target);
+            if outcome.excluded {
+                return Err(format!("target '{}' excluded by engagement policy", target));
+            }
+            if outcome.rule.is_none() {
+                return Err(format!(
+                    "target '{}' not in engagement policy allowlist (targets={})",
+                    target,
+                    policy.targets.len()
+                ));
+            }
+            return Ok(());
+        }
         if !validate_target_in_allowlist(target, &self.allowlist_hosts) {
             return Err(format!(
                 "target '{}' not in allowlist (len={}) — use --allowlist-hosts",
@@ -30,18 +49,37 @@ impl SecurityContext {
         }
         Ok(())
     }
+
+    pub fn grant_human_approval(&self, category: &str) {
+        self.human_approvals
+            .lock()
+            .expect("human_approvals lock")
+            .insert(category.to_string());
+    }
+
+    pub fn has_human_approval(&self, category: &str) -> bool {
+        self.human_approvals
+            .lock()
+            .expect("human_approvals lock")
+            .contains(category)
+    }
 }
 
 fn validate_target_in_allowlist(target: &str, allowlist: &[String]) -> bool {
     if allowlist.is_empty() {
         return false;
     }
+    let norm = crate::engagement::normalize_host(target);
+    if norm.is_empty() {
+        return false;
+    }
     for entry in allowlist {
         if entry.contains('/') {
             if let Some((net, bits)) = entry.split_once('/') {
-                if let Ok(prefix) = net.parse::<std::net::IpAddr>() {
+                let net_norm = crate::engagement::normalize_host(net);
+                if let Ok(prefix) = net_norm.parse::<std::net::IpAddr>() {
                     if let Ok(mask_len) = bits.parse::<u32>() {
-                        if let Ok(ip) = target.parse::<std::net::IpAddr>() {
+                        if let Ok(ip) = norm.parse::<std::net::IpAddr>() {
                             if ip_in_cidr(ip, prefix, mask_len) {
                                 return true;
                             }
@@ -49,11 +87,11 @@ fn validate_target_in_allowlist(target: &str, allowlist: &[String]) -> bool {
                     }
                 }
             }
-        } else if entry == target
-            || target.ends_with(entry)
-            || target == entry
-        {
-            return true;
+        } else {
+            let entry_norm = crate::engagement::normalize_host(entry);
+            if entry_norm == norm || norm.ends_with(format!(".{}", entry_norm).as_str()) {
+                return true;
+            }
         }
     }
     false
@@ -195,7 +233,10 @@ impl ToolRegistry {
             std::sync::Arc::new(base::FsEdit),
             std::sync::Arc::new(base::FsGlob),
             std::sync::Arc::new(base::FsExists),
+            std::sync::Arc::new(base::FsList),
+            std::sync::Arc::new(base::FsDelete),
             std::sync::Arc::new(base::WebFetch),
+            std::sync::Arc::new(base::WebSearch),
             std::sync::Arc::new(base::CliExec::new(sec.clone())),
         ];
         for tool in base_tools {
@@ -207,6 +248,8 @@ impl ToolRegistry {
             std::sync::Arc::new(recon::Dig),
             std::sync::Arc::new(recon::Whois),
             std::sync::Arc::new(recon::TheHarvester),
+            std::sync::Arc::new(recon::Shodan),
+            std::sync::Arc::new(recon::ReconNg),
         ];
         for tool in recon_tools {
             reg.register(tool);
@@ -219,6 +262,12 @@ impl ToolRegistry {
             reg.register(tool);
         }
         for tool in crate::forensics::create_all() {
+            reg.register(tool);
+        }
+        for tool in crate::web::create_all() {
+            reg.register(tool);
+        }
+        for tool in crate::office::create_all() {
             reg.register(tool);
         }
 

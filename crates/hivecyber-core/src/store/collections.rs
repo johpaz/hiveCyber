@@ -15,6 +15,31 @@ pub const COL_MCP_SERVERS: &str = "mcp_servers";
 pub const COL_CAPABILITY_DOCS: &str = "capability_docs";
 pub const COL_AUDIT_LOG: &str = "audit_log";
 pub const COL_PROOF_PACKETS: &str = "proof_packets";
+pub const COL_SECRETS: &str = "secrets";
+pub const COL_MEMORY: &str = "memory";
+pub const COL_SETTINGS: &str = "settings";
+pub const COL_MODELS: &str = "models";
+
+/// Model catalog entry — mirror of Hive's `storage/seed.ts` models array. The
+/// single source of truth for provider, context window and cost. Doc id is
+/// `"<provider_id>::<model_id>"` so reseller providers can offer the same model
+/// without colliding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDoc {
+    pub id: String,
+    pub model_id: String,
+    pub provider_id: String,
+    pub name: String,
+    pub model_type: String,
+    #[serde(default)]
+    pub context_window: u32,
+    #[serde(default)]
+    pub input_per_1m: f64,
+    #[serde(default)]
+    pub output_per_1m: f64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]

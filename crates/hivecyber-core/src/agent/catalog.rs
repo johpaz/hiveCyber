@@ -18,7 +18,7 @@ pub struct CatalogPersona {
 pub fn catalog_personas() -> Vec<CatalogPersona> {
     use crate::store::collections::*;
 
-    vec![
+    let mut personas = vec![
         CatalogPersona {
             id: "recon_operator".into(),
             name: "Operador de Reconocimiento".into(),
@@ -196,7 +196,36 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             model_override: None,
             routing_exclusions: None,
         },
-    ]
+    ];
+
+    // Activate the (previously dead) routing_exclusions field so the
+    // catalog-selector can route a request away from workers whose exclusions
+    // overlap it (e.g. don't send a port-scan to report_writer).
+    for p in personas.iter_mut() {
+        p.routing_exclusions = routing_exclusions_for(&p.id);
+    }
+    personas
+}
+
+/// Per-worker routing exclusions ("NO usar para…"). Kept here so both the seed
+/// and the live routing catalog share one source of truth.
+fn routing_exclusions_for(id: &str) -> Option<Vec<String>> {
+    let ex: &[&str] = match id {
+        "recon_operator" => &["redaccion de informes", "explotacion de vulnerabilidades", "analisis forense de memoria"],
+        "vuln_scanner" => &["redaccion de informes", "reconocimiento de red", "explotacion activa"],
+        "exploit_operator" => &["redaccion de informes", "reconocimiento de red", "analisis forense"],
+        "forensics_analyst" => &["escaneo de red", "explotacion de vulnerabilidades", "redaccion de informes"],
+        "web_pentester" => &["analisis forense de memoria", "redaccion de informes", "reconocimiento de red"],
+        "threat_intel_analyst" => &["explotacion de vulnerabilidades", "analisis forense", "redaccion de informes"],
+        "report_writer" => &["escaneo de puertos", "explotacion de vulnerabilidades", "reconocimiento activo"],
+        "workspace_file_operator" => &["escaneo de red", "explotacion de vulnerabilidades", "analisis forense"],
+        _ => &[],
+    };
+    if ex.is_empty() {
+        None
+    } else {
+        Some(ex.iter().map(|s| s.to_string()).collect())
+    }
 }
 
 pub const COORDINATOR_SYSTEM_PROMPT: &str = r#"# HIVECYBER — Caelum (Agente Coordinador)

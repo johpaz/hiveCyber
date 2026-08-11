@@ -109,11 +109,27 @@ let status = verdict(&checks);  // Passed | Failed | Unchecked
 | `checkTool` | invoca tool determinista con `{goal: description}` |
 | `artifact_inspect` | verifica artifact_id en evidence |
 
-## Compaction (pendiente)
+## Compaction (implementado)
 
-Hive compacta el historial cuando threshold > 0.80:
-- Sumariza mensajes viejos en un summary
-- Scratchpad + notes sobreviven compaction
-- TOON encoding para token savings
+El loop compacta el *working-set en memoria* cuando su estimación de tokens supera el
+**budget derivado del context window real del modelo** (`context_window * 0.70`, tomado de
+`COL_MODELS` — el catálogo espejo de Hive). Si el modelo no está en el catálogo (p. ej.
+local/ollama) cae al fallback `config.models.context_token_budget` (env
+`HIVECYBER_CONTEXT_BUDGET`, default 24000; `0` desactiva). Módulos: `agent/compaction.rs`,
+`agent/models_catalog.rs`.
 
-En hiveCyber MVP: historial last 15 mensajes en memoria, sin compaction aun.
+- Antes de cada llamada al modelo, `maybe_compact` evalúa el presupuesto.
+- Sumariza el prefijo antiguo en **un** mensaje `user` de resumen (vía el modelo,
+  con fallback determinista `extractive_summary` si la llamada falla) y conserva
+  las últimas `MIN_RECENT_MESSAGES` verbatim.
+- **Corte seguro**: el límite avanza hasta un mensaje `role == "assistant"`, lo que
+  (a) evita dejar un `tool_result` huérfano y (b) garantiza la alternancia
+  `user(resumen) → assistant(...)`.
+- **No toca `COL_MESSAGES`**: la conversación persistida (registro append-only para
+  auditoría y `resume`) queda intacta; la compaction solo reduce lo que se envía al
+  modelo. No hay context-window por modelo en la BD, así que el trigger es el
+  presupuesto configurable (heurístico, ~4 chars/token).
+
+Pendiente (Roadmap): checkpoints durables del run del coordinador y reconstrucción
+de mensajes desde `COL_MESSAGES` en `resume` (hoy `resume` reinyecta una señal de
+continuación, no rehidrata el historial).

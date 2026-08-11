@@ -155,7 +155,7 @@ En Hive:
 - Skills seleccionadas expanden el tool loadout del turno
 - Skill bodies + rules se inyectan en system prompt
 
-En hiveCyber MVP: skills cargadas pero skill-selector pendiente de implementar. El CLI puede listarlas via `hivecyber skills list`. El nombre de skills se referencia en `preferred_agents` del catalog.
+En hiveCyber: skills cargadas y listables via `hivecyber skills list`. El motor BM25 de `capability_search` ya indexa el tipo `Skill`; el skill-selector automático es Roadmap. El nombre de skills se referencia en `preferred_agents` del catalog.
 
 ## CLI
 

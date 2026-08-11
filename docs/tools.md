@@ -31,12 +31,12 @@ API:
 
 | categoria | tools | descripcion |
 |---|---|---|
-| Base | fs_read, fs_write, fs_edit, fs_glob, fs_exists, web_fetch, cli_exec | filesystem y web basico |
-| Recon | nmap, dig, whois, theharvester | reconocimiento activo y OSINT |
+| Base | fs_read, fs_write, fs_edit, fs_glob, fs_exists, fs_list, fs_delete, web_fetch, web_search, cli_exec, office_read, office_write | filesystem, web y office |
+| Recon | nmap, dig, whois, theharvester, shodan, recon_ng | reconocimiento activo y OSINT |
 | Vulns | nuclei, nikto, sqlmap, searchsploit, semgrep, trivy | deteccion de vulnerabilidades |
 | Exploit | metasploit_rpc, hydra, crackmapexec, mimikatz | explotacion (Sandbox) |
 | Forensics | volatility, yara_scan, zeek_parse, osquery, log_parse | forense + cadena de custodia |
-| Web | (pendiente) | browser automation para web_pentester |
+| Web | browser_navigate, browser_click, browser_type, browser_screenshot, browser_extract | browser automation via agent-browser |
 | Base (delegation) | task_delegate, task_status | delegacion coordinator->worker |
 
 ## SecurityContext
@@ -113,7 +113,7 @@ Sin sandbox, con cadena de custodia:
 ### Delegation (`tools/src/delegation/mod.rs`)
 
 - `task_delegate { worker_id, task_description, mode, acceptance }` -> crea TaskDoc + JobDoc en DurableQueue
-- `task_status { task_id }` -> (pendiente)
+- `task_status { task_id }` -> estado de la tarea delegada (lee COL_TASKS)
 
 ## Worker bin sandboxed
 
