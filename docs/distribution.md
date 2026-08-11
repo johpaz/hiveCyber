@@ -61,6 +61,43 @@ tar xzf hivecyber-*.tar.gz && sudo install hivecyber-*/hivecyber* /usr/local/bin
 # Windows: descomprime el .zip y agrega la carpeta al PATH
 ```
 
+## Paquetes Linux (.deb / .rpm)
+
+El release también publica **`.deb`** (familia Debian: Debian, Ubuntu, Mint, Kali…) y
+**`.rpm`** (familia RPM: Fedora, RHEL/Rocky/Alma, openSUSE…), para **amd64 y arm64**,
+generados con [`nfpm`](https://nfpm.goreleaser.com/) desde `packaging/nfpm.yaml`. Instalan
+`hivecyber` y `hivecyber-worker` en `/usr/bin`.
+
+```bash
+# Debian/Ubuntu/Kali/…
+sudo dpkg -i hivecyber_<ver>_amd64.deb        # o arm64
+# Fedora/RHEL/openSUSE/…
+sudo rpm -i hivecyber-<ver>-1.x86_64.rpm      # o aarch64
+```
+
+**Notas de portabilidad (importante):**
+- Un `.deb`/`.rpm` **no es "solo Ubuntu"** — es por *familia de empaquetado*, no por distro.
+- Los binarios se compilan con **glibc** en `ubuntu-latest`, así que corren en distros glibc
+  cuyo glibc sea **≥** el del build. Distros con glibc muy viejo pueden no ejecutarlos.
+- Los `.deb`/`.rpm` son glibc → **no corren en Alpine** (musl). Para eso usa el binario
+  **musl-static** (abajo) o la **imagen Docker**.
+
+## Binario musl-static (corre en CUALQUIER distro, incl. Alpine)
+
+El release también publica binarios **estáticos musl** (`x86_64-unknown-linux-musl` y
+`aarch64-unknown-linux-musl`) como `.tar.gz`. Al estar enlazados estáticamente **no dependen
+de glibc**, así que corren en cualquier distribución — Alpine, distros viejas, contenedores
+`scratch`/`distroless`, etc. Es la opción "un solo binario, cualquier Linux".
+
+```bash
+tar xzf hivecyber-*-x86_64-unknown-linux-musl.tar.gz
+sudo install hivecyber-*/hivecyber* /usr/local/bin/
+```
+
+Se compilan con [`cross`](https://github.com/cross-rs/cross) (Docker, trae el toolchain musl
+completo que necesita `ring`/rustls). El sandbox seccomp del worker sigue siendo Linux-only,
+pero funciona igual en un binario musl.
+
 ## Docker (recomendado para el toolchain completo)
 
 La imagen `Dockerfile` es *batteries-included*: trae ambos binarios y el subset de

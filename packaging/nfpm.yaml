@@ -1,0 +1,36 @@
+# nfpm config — genera .deb y .rpm de hiveCyber desde una sola definición.
+# Los valores ${...} se expanden desde variables de entorno en CI:
+#   PKG_ARCH   = amd64 | arm64   (nfpm mapea a x86_64/aarch64 en el .rpm)
+#   PKG_VERSION= versión sin la 'v' (p.ej. 0.1.0)
+#   BIN_DIR    = target/<triple>/release
+#
+# Ambos binarios se instalan en /usr/bin. Sin dependencias de sistema: las tools
+# cybersec (nmap/nuclei/…) son opcionales y se resuelven en runtime (ver `doctor`).
+name: hivecyber
+arch: "${PKG_ARCH}"
+platform: linux
+version: "${PKG_VERSION}"
+section: utils
+priority: optional
+maintainer: "John Paez"
+vendor: "hiveCyber"
+license: "MIT"
+description: |
+  Harness de ciberseguridad en Rust con agentes de larga duración: un coordinador
+  (Caelum) delega en workers especializados (recon, vulns, exploit, forense, web,
+  threat-intel, reportes), con sandbox seccomp, auditoría tamper-evident y
+  búsqueda dinámica de herramientas. Solo para objetivos autorizados.
+
+contents:
+  - src: "${BIN_DIR}/hivecyber"
+    dst: /usr/bin/hivecyber
+    file_info:
+      mode: 0755
+  - src: "${BIN_DIR}/hivecyber-worker"
+    dst: /usr/bin/hivecyber-worker
+    file_info:
+      mode: 0755
+  - src: ./README.md
+    dst: /usr/share/doc/hivecyber/README.md
+    file_info:
+      mode: 0644

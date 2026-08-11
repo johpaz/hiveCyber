@@ -16,6 +16,42 @@ pub struct Doc {
     pub version: Option<u64>,
 }
 
+/// Map a logical doc id to a filesystem-safe filename component, and back. Doc
+/// ids legitimately contain characters that are illegal in filenames — `:` (the
+/// `namespace::key` / `provider::model` separator, reserved on Windows/NTFS) and
+/// `/` (inside model ids like `openrouter::anthropic/claude-opus-5`, which would
+/// otherwise create subdirectories). Percent-encoding everything outside a safe
+/// set makes storage work identically on Linux, macOS and Windows and stays
+/// reversible so `list()` recovers the original id.
+fn encode_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn decode_id(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&name[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 #[derive(Clone)]
 pub struct HiveDb {
     base_dir: PathBuf,
@@ -66,11 +102,7 @@ impl HiveDb {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                    let id = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
+                    let id = decode_id(&path.file_stem().unwrap_or_default().to_string_lossy());
                     if let Ok(content) = fs::read_to_string(&path).await {
                         if let Ok(doc) = serde_json::from_str::<Value>(&content) {
                             Self::index_doc(&id, &doc, &mut index_by_field);
@@ -103,7 +135,7 @@ impl HiveDb {
     }
 
     pub async fn insert(&self, collection: &str, id: &str, data: Value) -> Result<()> {
-        let file_path = self.base_dir.join(collection).join(format!("{}.json", id));
+        let file_path = self.base_dir.join(collection).join(format!("{}.json", encode_id(id)));
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -151,7 +183,7 @@ impl HiveDb {
     }
 
     pub async fn delete(&self, collection: &str, id: &str) -> Result<()> {
-        let file_path = self.base_dir.join(collection).join(format!("{}.json", id));
+        let file_path = self.base_dir.join(collection).join(format!("{}.json", encode_id(id)));
         if file_path.exists() {
             fs::remove_file(&file_path).await?;
         }
@@ -199,5 +231,51 @@ impl HiveDb {
             .get(collection)
             .map(|c| c.docs.len())
             .unwrap_or(0)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_yields_safe_filename_and_roundtrips() {
+        // Ids that contain filename-illegal chars on Windows (`:`) or path
+        // separators (`/`), plus a plain one.
+        for id in [
+            "anthropic::claude-sonnet-5",
+            "openrouter::anthropic/claude-opus-5",
+            "recon::host-a",
+            "hiveagents::Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "plain-id_1.0",
+        ] {
+            let enc = encode_id(id);
+            assert!(
+                !enc.contains(':') && !enc.contains('/') && !enc.contains('\\'),
+                "encoded '{}' still has an unsafe char: {}",
+                id,
+                enc
+            );
+            assert_eq!(decode_id(&enc), id, "roundtrip failed for {}", id);
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_id_with_colon_and_slash_roundtrips_and_reopens() {
+        let dir = std::env::temp_dir().join(format!("hc_enc_{}", uuid::Uuid::new_v4()));
+        let id = "openrouter::anthropic/claude-opus-5";
+        {
+            let db = HiveDb::open(&dir).await.unwrap();
+            db.insert("models", id, serde_json::json!({ "ctx": 1_000_000 }))
+                .await
+                .expect("insert with ':' and '/' must succeed on any OS");
+            assert!(db.get("models", id).await.is_some(), "get by logical id");
+            let items = db.list("models").await;
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].0, id, "list recovers the exact logical id");
+        }
+        // Reopen from disk → decode must recover the id.
+        let db2 = HiveDb::open(&dir).await.unwrap();
+        assert!(db2.get("models", id).await.is_some(), "id survives a reopen");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
