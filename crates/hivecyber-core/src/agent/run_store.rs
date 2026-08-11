@@ -49,6 +49,88 @@ pub async fn create_run(
     Ok(id)
 }
 
+/// Get the active run for a thread (running/interrupted/pending) or create one,
+/// marking it running. One durable run per conversation thread — the interactive
+/// coordinator loop checkpoints into it so `resume` has something to find.
+pub async fn ensure_run(
+    db: &HiveDb,
+    kind: &str,
+    agent_id: &str,
+    thread_id: &str,
+    goal: serde_json::Value,
+) -> Result<String> {
+    for (id, doc) in db.list(COL_RUNS).await {
+        let same_thread = doc.get("thread_id").and_then(|v| v.as_str()) == Some(thread_id);
+        let status = doc.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if same_thread
+            && matches!(
+                status,
+                RUN_STATUS_RUNNING | RUN_STATUS_INTERRUPTED | RUN_STATUS_PENDING
+            )
+        {
+            // Reactivate the existing run.
+            if let Some(mut run) = db.get(COL_RUNS, &id).await {
+                if let Some(obj) = run.as_object_mut() {
+                    obj.insert("status".into(), RUN_STATUS_RUNNING.into());
+                }
+                db.insert(COL_RUNS, &id, run).await?;
+            }
+            return Ok(id);
+        }
+    }
+
+    let id = create_run(db, kind, agent_id, thread_id, goal).await?;
+    if let Some(mut run) = db.get(COL_RUNS, &id).await {
+        if let Some(obj) = run.as_object_mut() {
+            obj.insert("status".into(), RUN_STATUS_RUNNING.into());
+        }
+        db.insert(COL_RUNS, &id, run).await?;
+    }
+    Ok(id)
+}
+
+/// Update a run's progress counters + a small checkpoint snapshot, and renew its
+/// lease (30 min). The full conversation lives in `COL_MESSAGES`; this is
+/// metrics + status for discovery and `resume`.
+pub async fn checkpoint_run(
+    db: &HiveDb,
+    run_id: &str,
+    iterations: u32,
+    tokens: u64,
+    state: serde_json::Value,
+) -> Result<()> {
+    if let Some(mut run) = db.get(COL_RUNS, run_id).await {
+        if let Some(obj) = run.as_object_mut() {
+            obj.insert("iterations_used".into(), serde_json::json!(iterations));
+            obj.insert("tokens_used".into(), serde_json::json!(tokens));
+            if !state.is_null() {
+                obj.insert("state_json".into(), state);
+            }
+            let lease = Utc::now()
+                .checked_add_signed(chrono::Duration::minutes(30))
+                .unwrap_or_else(Utc::now);
+            obj.insert("lease_expires_at".into(), lease.to_rfc3339().into());
+        }
+        db.insert(COL_RUNS, run_id, run).await?;
+    }
+    Ok(())
+}
+
+/// Mark a still-running run as interrupted (e.g. the process exited or the loop
+/// errored) so `resume` can pick it up.
+pub async fn interrupt_run(db: &HiveDb, run_id: &str) -> Result<()> {
+    if let Some(mut run) = db.get(COL_RUNS, run_id).await {
+        let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == RUN_STATUS_RUNNING {
+            if let Some(obj) = run.as_object_mut() {
+                obj.insert("status".into(), RUN_STATUS_INTERRUPTED.into());
+            }
+            db.insert(COL_RUNS, run_id, run).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn complete_run(db: &HiveDb, run_id: &str) -> Result<()> {
     let mut run = db
         .get(COL_RUNS, run_id)

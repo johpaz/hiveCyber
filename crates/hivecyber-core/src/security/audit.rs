@@ -1,11 +1,44 @@
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
 
 use crate::store::HiveDb;
 use crate::store::collections::{COL_AUDIT_LOG, AuditLogEntry};
 
 pub const GENESIS_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Process-global lock serializing the read-head + append critical section of
+/// the audit chain. Without it, two concurrent workers can both read the same
+/// `prev_hash`, build different entries, and fork the chain. The audit log is a
+/// single collection under a single `HIVECYBER_HOME`, and every write happens in
+/// the orchestrator process, so one process-wide lock is the right granularity.
+/// (Cross-process writers against the same home would need an OS file lock — out
+/// of scope for the single-process agent runtime.)
+fn audit_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Atomically extend the audit chain. Under the global audit lock: read the
+/// current head hash and append a new entry chained to it, returning the new
+/// head. This is the ONLY correct way to append — callers must not interleave
+/// their own `get_last_hash` + `log_audit`, which is exactly the race this
+/// closes.
+pub async fn append_audit(
+    db: &HiveDb,
+    tool: &str,
+    target: &str,
+    worker: &str,
+    run_id: &str,
+    operator_id: &str,
+) -> Result<String> {
+    let _guard = audit_lock().lock().await;
+    let prev = get_last_hash(db).await;
+    log_audit(db, tool, target, worker, run_id, operator_id, &prev).await
+}
 
 /// SHA-256 over the entry's canonical field order. Single source of truth so
 /// `log_audit`, `get_last_hash`, and `verify_chain` can never drift.

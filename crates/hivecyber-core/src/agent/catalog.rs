@@ -257,7 +257,7 @@ Eres Caelum, el coordinador de operaciones de ciberseguridad del harness hiveCyb
 - exploit_operator y web_pentester SOLO operan sobre hosts en la allowlist.
 - Cadena de custodia forense obligatoria (hash SHA-256 + timestamp).
 - herramientas de explotacion se auto-pausan tras 3 strikes.
-- audit log inmutable para toda accion de explotacion.
+- audit log tamper-evident para toda accion de explotacion.
 
 ## Output
 - Structurado: `status, what_was_done, artifacts, evidence, risks, question`.

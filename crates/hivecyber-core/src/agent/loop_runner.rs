@@ -71,8 +71,36 @@ impl AgentLoop {
         let db = self.db.clone();
         let config = self.config.clone();
 
+        // Durable run for this conversation thread: gives `resume` something to
+        // find, and records status/metrics. One run per thread (reused across
+        // turns). The full history lives in COL_MESSAGES.
+        let run_id = crate::agent::run_store::ensure_run(
+            &db,
+            "chat",
+            &opts.agent_id,
+            &opts.thread_id,
+            serde_json::json!({ "message": opts.user_message }),
+        )
+        .await
+        .ok();
+
         tokio::spawn(async move {
-            if let Err(e) = run_loop(db, config, opts, tx.clone()).await {
+            let result = run_loop(db.clone(), config, opts, tx.clone(), run_id.clone()).await;
+
+            // Seal the run: completed on a clean finish, interrupted on error so
+            // it shows up as resumable.
+            if let Some(rid) = &run_id {
+                match &result {
+                    Ok(()) => {
+                        let _ = crate::agent::run_store::complete_run(&db, rid).await;
+                    }
+                    Err(_) => {
+                        let _ = crate::agent::run_store::interrupt_run(&db, rid).await;
+                    }
+                }
+            }
+
+            if let Err(e) = result {
                 let _ = tx
                     .send(StreamChunk::Error {
                         message: e.to_string(),
@@ -95,6 +123,7 @@ async fn run_loop(
     config: Config,
     opts: AgentLoopOptions,
     tx: mpsc::Sender<StreamChunk>,
+    run_id: Option<String>,
 ) -> Result<()> {
     use hivecyber_providers::{CallRequest, Content};
 
@@ -315,6 +344,7 @@ async fn run_loop(
     }
 
     let mut stuck = crate::agent::stuck::StuckLoopDetector::new();
+    let mut total_tokens: u64 = 0;
 
     // Every tool call in the interactive/coordinator loop must go through the
     // audited middleware — same as the worker path in harness/executors.rs.
@@ -332,7 +362,7 @@ async fn run_loop(
         operator_id: opts.security.operator_id.clone(),
     };
 
-    for _iteration in 0..max_iter {
+    for iteration in 0..max_iter {
         // Compact the in-memory working set if it has grown past the budget.
         // Only the working set is touched — COL_MESSAGES stays the full,
         // append-only record (used for audit and resume).
@@ -371,6 +401,19 @@ async fn run_loop(
                 output_tokens: response.output_tokens,
             })
             .await;
+
+        // Checkpoint the durable run each turn (iterations + tokens + lease).
+        total_tokens += response.input_tokens + response.output_tokens;
+        if let Some(rid) = &run_id {
+            let _ = crate::agent::run_store::checkpoint_run(
+                &db,
+                rid,
+                iteration + 1,
+                total_tokens,
+                serde_json::json!({ "thread_id": opts.thread_id, "turn": iteration + 1 }),
+            )
+            .await;
+        }
 
         let tool_calls = response.tool_calls().to_vec();
 

@@ -2,14 +2,18 @@
 
 Harness de ciberseguridad en Rust con agentes de larga duracion, inspirado en [Hive](https://github.com/johpaz/hive-agents).
 
-## Estado: producción (endurecido)
+## Estado: endurecido · pre-producción para bug bounty
+
+El núcleo (harness, delegación, sandbox seccomp, auditoría tamper-evident, BM25) está
+implementado y testeado. **Antes de operar contra programas reales (Bugcrowd/HackerOne)**
+faltan controles de seguridad de engagement listados en el [Roadmap de seguridad](#roadmap-de-seguridad-pre-bug-bounty).
 
 | Componente | Tests | Estado |
 |---|---|---|
 | Workspace Cargo (7 crates) | — | `cargo build --release` OK |
 | HiveDB documental (15 collections) | 10 | insert/get/delete/list/overwrite |
 | ProviderRegistry (16 providers, base URLs/modelos alineados a Hive) | 31 | Anthropic/Gemini/Ollama custom + OpenAI-compat + hiveagents |
-| ToolRegistry (37 tools) + `cli_exec` gating | 29+ | base/recon/vulns/exploit/forensics/web/office, `--allow-cli-exec` |
+| ToolRegistry (38 tools base) + `cli_exec` gating | 29+ | base/recon/vulns/exploit/forensics/web/office, `--allow-cli-exec` |
 | SkillLoader (17 skills bundled) | 8 | YAML frontmatter + walkdir |
 | DurableQueue + DispatchLoop | 2 | enqueue/claim/complete/find_pending |
 | Acceptance checks + policies | 5 | auto-pause @3, auto-disable @5, audit chain |
@@ -18,19 +22,19 @@ Harness de ciberseguridad en Rust con agentes de larga duracion, inspirado en [H
 | EngagementPolicy (`tools/src/engagement.rs`) | 18 | host matching exacto/subdominio/CIDR v4+v6, exclusiones, glob de paths |
 | Worker sandbox (`hivecyber-worker/src/sandbox.rs`) | 8 | seccomp allowlist funcional (arranca y ejecuta), rlimits, namespaces best-effort |
 | Búsqueda BM25 de capacidades (`agent/capability_search.rs` + tool/catalog selector) | 14 | tantivy, tokenizer ES, tool-selector (máx 12/turno) enganchado al loop, routing_exclusions |
-| **Total** (`cargo test --workspace`) | **158** | todos verdes |
+| **Total** (`cargo test --workspace`) | **187** | todos verdes |
 
 ## Caracteristicas
 
-- **Agent loop de larga duracion** con durable runs, leases (30min renew 30s), checkpoints, stuck-loop detector y **compaction de contexto** (resume el working-set en memoria por presupuesto de tokens sin tocar el historial durable `COL_MESSAGES`, con corte seguro de pares tool_use/tool_result)
+- **Agent loop de larga duracion** con **run durable por hilo** (`ensure_run`/`checkpoint_run`/`interrupt_run`, discovery con `hivecyber runs`, `resume` rehidrata desde `COL_MESSAGES`), leases (30min), stuck-loop detector y **compaction de contexto** (resume el working-set en memoria por presupuesto de tokens sin tocar el historial durable `COL_MESSAGES`, con corte seguro de pares tool_use/tool_result)
 - **1 coordinador (Caelum) + 8 workers especializados** en cybersec
 - **Delegacion paralela** coordinator->worker con acceptance checks deterministas via `checkTool`
-- **43 tools**: filesystem (7: read/write/edit/glob/exists/list/delete), web (2: fetch/search), cli (1), recon (6: nmap/dig/whois/theharvester/shodan/recon_ng), vulns (6), exploit (4), forensics (5), browser (5: navigate/click/type/screenshot/extract vía `agent-browser`), office (2: read/write docx/xlsx/pdf), delegation (4: delegate/status/list/revise), memory (4: write/read/list/search — notas persistentes para agentes de larga duración) — más los tools MCP expuestos dinámicamente
+- **38 tools base** (ToolRegistry): filesystem (7: read/write/edit/glob/exists/list/delete), web (2: fetch/search), cli (1), recon (6: nmap/dig/whois/theharvester/shodan/recon_ng), vulns (6), exploit (4), forensics (5), browser (5: navigate/click/type/screenshot/extract vía `agent-browser`), office (2: read/write docx/xlsx/pdf). **+8 tools de agente** registradas en el loop: delegation (4: delegate/status/list/revise) y memory (4: write/read/list/search) — **más los tools MCP expuestos dinámicamente**
 - **Búsqueda dinámica BM25/tantivy (trilogía completa, paridad con `capability-search` de Hive)**: `tool-selector` (máx 12 tools/turno, corto-circuito conversacional), `catalog-selector` (rutea workers, respeta `routing_exclusions` — inyectado **en vivo** al prompt del coordinador vía `routing_context`), y `skill-selector` (surface de skills relevantes a la tarea, en coordinador y workers). Menos tokens, mejor precisión y ruteo.
 - **17 skills bundled**: recon_workflow, osint_correlation, vuln_scan_workflow, cve_lookup, pwn_check, post_exploit_chain, lateral_movement, poc_reproduction, memory_analysis, log_timeline, ioc_extraction, pentest_report, cvss_scoring, threat_modeling, opsec, clean_up, persistence
 - **16+ proveedores LLM**: Anthropic, OpenAI, Gemini, Ollama, Groq, Mistral, OpenRouter, DeepSeek, Kimi, Nvidia, Qwen, MinMax, Zai, ModelScope, OpencodeGo, HiveAgents
 - **Catálogo de modelos (espejo de Hive)**: 89 modelos LLM sembrados en `COL_MODELS` con provider, **context window** y **costo** (USD/1M in/out) — fuente única de verdad. El **budget de compaction se deriva del ctx real por modelo** (no un valor fijo); `hivecyber models` lista el catálogo.
-- **MCP nativo** JSON-RPC con transportes **stdio + streamable-HTTP/SSE**; los servers se persisten (`mcp_servers`), se conectan en boot y sus tools se exponen al agente vía `McpToolProxy` (entran al tool-selector BM25). CLI completa (`mcp add/list/connect/tools/call/disconnect/remove`).
+- **MCP nativo** JSON-RPC con transportes **stdio + streamable-HTTP/SSE + WebSocket** (`wss://` vía rustls) y **reconnect con backoff** en sesiones caídas; los servers se persisten (`mcp_servers`), se conectan en boot y sus tools se exponen al agente vía `McpToolProxy` (entran al tool-selector BM25). CLI completa (`mcp add/list/connect/tools/call/disconnect/remove`).
 - **Configuración persistente y segura**: `provider set/list/show/default`, `agent set-model/set-provider/disable`, `skills add`. Las API keys se guardan **cifradas (AES-256-GCM)** con master key en `<home>/.master.key` (0600); una vez configurado, corre sin env vars.
 - **HiveDB-style** document store en Rust (JSON-on-files + indices en RAM)
 - **Worker sandbox real** (`hivecyber-worker`): seccomp BPF allowlist + rlimits + drop de capabilities + namespaces de usuario/mount, para las tools de explotacion (`isolation = Sandbox`). El `SecurityContext` del llamador viaja al subproceso — el sandbox no usa un contexto por defecto.
@@ -43,7 +47,7 @@ Harness de ciberseguridad en Rust con agentes de larga duracion, inspirado en [H
   - Modo dual default-OFF: `--unsafe-mode` + `--allowlist-hosts <file>` (o `--engagement-policy <file>`)
   - `cli_exec` desactivado por defecto, requiere `--allow-cli-exec` ademas de `--unsafe-mode`
   - Session timeout exploit 15min idle
-  - Audit log inmutable con SHA-256 hash chain
+  - Audit log **tamper-evident** con SHA-256 hash chain (append atómico bajo lock global — sin bifurcaciones concurrentes)
   - Cadena de custodia forense (hash + timestamp) en volatility
   - Denylist hardcoded: `rm -rf /`, `sudo`, `chmod 777`, `mkfs`, fork bomb
 - **CLI** interactivo (`hivecyber chat`) y no-interactivo (`hivecyber run`)
@@ -52,8 +56,7 @@ Harness de ciberseguridad en Rust con agentes de larga duracion, inspirado en [H
 
 Funcionalidad planificada, aún no implementada (el resto del harness es funcional y testeado):
 
-- **Checkpoints durables del coordinador**: `resume` ya rehidrata el historial desde `COL_MESSAGES` (abajo), pero falta persistir checkpoints/estado del run del coordinador para reanudar mitad-de-turno con tools en vuelo (hoy solo los `worker_task` son durables).
-- **MCP transport WebSocket + reconnect**: el cliente MCP soporta stdio y streamable-HTTP/SSE, con auto-registro de servers en boot. Falta el transport WebSocket y el reconnect con backoff en stale-session.
+- **Reanudar mitad-de-turno con tools en vuelo**: el loop del coordinador ya persiste un run durable por hilo (`ensure_run`/`checkpoint_run`/`interrupt_run`, comando `runs`) y `resume` rehidrata el historial desde `COL_MESSAGES`; falta capturar el estado de un turno interrumpido con llamadas a tools a medio ejecutar (hoy se reanuda desde el último mensaje limpio).
 - **Browser dentro del sandbox**: los `browser_*` corren in-process vía `agent-browser` (Chrome en su propio subproceso); no se rutean al worker seccomp. Confinar el browser requeriría reingeniería del sandbox.
 - **Sandbox real en macOS/Windows**: hoy las tools `Isolation::Sandbox` se rechazan fail-closed fuera de Linux (opt-in `HIVECYBER_ALLOW_UNSANDBOXED=1`). Un confinamiento nativo (Seatbelt en macOS, Job Objects/AppContainer en Windows) permitiría ejecutarlas confinadas sin Docker.
 
@@ -151,9 +154,9 @@ hivecyber config show
 | `caelum` | coordinador | descompone, delega, reintegra | none |
 | `recon_operator` | worker | recon + OSINT | none |
 | `vuln_scanner` | worker | deteccion de vulns | none |
-| `exploit_operator` | worker | explotacion | seccomp+netns |
+| `exploit_operator` | worker | explotacion | seccomp (sin netns) |
 | `forensics_analyst` | worker | forense + cadena de custodia | none |
-| `web_pentester` | worker | pentesting web | seccomp+netns |
+| `web_pentester` | worker | pentesting web | seccomp (sin netns) |
 | `threat_intel_analyst` | worker | threat intel + IoCs | none |
 | `report_writer` | worker | informes | none |
 | `workspace_file_operator` | worker | filesystem generico | none |
@@ -187,9 +190,26 @@ Ver `.env.example` para todas las API keys soportadas.
 ## Testing
 
 ```bash
-cargo test --release
-# 86 tests, 0 failures
+cargo test --workspace
+# 187 tests, 0 failures
 ```
+
+## Roadmap de seguridad (pre bug bounty)
+
+Controles de *engagement* requeridos antes de operar agentes autónomos contra programas
+reales (Bugcrowd/HackerOne). Estado actual entre corchetes:
+
+- **Auditoría atómica** de la cadena hash. [✅ hecho — `append_audit` bajo lock global; test de concurrencia]
+- **Ventanas horarias** de engagement. [✅ hecho — `EngagementPolicy::is_within_window`, aplicado en `validate_target`]
+- **Rate limiting compartido** por programa y por destino. [✅ hecho — limiter process-global por `programa::host`, fail-closed; aplicado en `validate_target` para tools in-process]
+- **PolicyGate obligatorio** delante de **toda** tool de red (que la política no sea opcional):
+  hoy el gate aplica allowlist/exclusiones/rutas/métodos/ventanas/rate y aprobaciones, pero si
+  no se pasa `--engagement-policy` cae al allowlist simple. [parcial: falta un modo que **exija**
+  política y rechace red sin ella]
+- **Control de egreso de red fuera del proceso** del agente (proxy/allowlist a nivel de red,
+  no solo validación in-process; cubre también las tools sandboxeadas del subproceso). [pendiente]
+- **Acceptance por evidencias estructuradas** (no heurísticas regex/substring). [pendiente]
+- **E2E contra apps vulnerables locales** (OWASP Juice Shop, WebGoat, DVWA). [pendiente]
 
 ## Licencia
 

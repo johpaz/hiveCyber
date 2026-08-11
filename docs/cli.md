@@ -28,9 +28,10 @@ Commands:
   mcp       Gestion de MCP servers
   config    Ver/editar config
   logs      Tail de traces
+  runs      Lista runs (para descubrir un run_id que reanudar)
   resume    Retomar run durable interrumpido
   doctor    Verificar dependencias cybersec instaladas
-  audit     Audit log inmutable
+  audit     Audit log tamper-evident
   version   Version del binario
   help      Print help
 
@@ -176,6 +177,17 @@ Lista `traces` de HiveDB (ultimas 50):
 ```
 [id] tool_name OK|FAIL durationMs
 ```
+
+### runs
+
+```bash
+hivecyber runs                        # RUN_ID, STATUS, AGENT, KIND, iteraciones, tokens
+```
+
+El loop del coordinador persiste un **run durable por hilo** (`ensure_run`), lo checkpointea
+cada turno (iteraciones + tokens + lease de 30 min) y lo marca `completed` al terminar o
+`interrupted` si el proceso/LLM falla. `runs` los lista (más recientes primero) para encontrar
+un `run_id` interrumpido que reanudar.
 
 ### resume
 

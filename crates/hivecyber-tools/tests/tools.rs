@@ -443,6 +443,38 @@ fn test_security_context_validate_target_allows_in_cidr() {
 }
 
 #[test]
+fn test_validate_target_enforces_rate_limit() {
+    use hivecyber_tools::{EngagementPolicy, TargetRule};
+
+    // 0.5 req/s → 2s min interval. A unique program name isolates this test's
+    // key in the process-global limiter.
+    let policy = EngagementPolicy {
+        program: "unit-ratelimit-test".into(),
+        targets: vec![TargetRule {
+            host: "example.com".into(),
+            paths: vec!["/**".into()],
+            methods: vec!["GET".into()],
+            rate_limit_rps: Some(0.5),
+            only_own_accounts: false,
+        }],
+        ..Default::default()
+    };
+    let sec = SecurityContext {
+        unsafe_mode: true,
+        allowlist_hosts: vec![],
+        operator_id: "t".into(),
+        engagement_policy: Some(Arc::new(policy)),
+        human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        allow_cli_exec: false,
+    };
+
+    assert!(sec.validate_target("example.com").is_ok(), "first request allowed");
+    let second = sec.validate_target("example.com");
+    assert!(second.is_err(), "immediate second request exceeds the 0.5 req/s limit");
+    assert!(second.unwrap_err().contains("rate limit"));
+}
+
+#[test]
 fn test_security_context_validate_target_blocks_outside_cidr() {
     let sec = SecurityContext {
         unsafe_mode: true,

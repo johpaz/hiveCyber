@@ -65,6 +65,8 @@ enum Commands {
         action: ConfigCommands,
     },
     Logs,
+    /// Lista los runs (para descubrir un run_id que reanudar con `resume`).
+    Runs,
     Resume {
         run_id: String,
     },
@@ -210,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Mcp { action } => cmd_mcp(db.clone(), action).await,
         Commands::Config { action } => cmd_config(&config, action).await,
         Commands::Logs => cmd_logs(db.clone()).await,
+        Commands::Runs => cmd_runs(db.clone()).await,
         Commands::Resume { run_id } => cmd_resume(db.clone(), &config, &run_id, security.clone()).await,
         Commands::Doctor => cmd_doctor().await,
         Commands::Audit { action } => cmd_audit(db.clone(), action).await,
@@ -1132,12 +1135,14 @@ async fn cmd_mcp(db: Arc<HiveDb>, action: McpCommands) -> anyhow::Result<()> {
                         anyhow::bail!("stdio transport requires --command");
                     }
                 }
-                "sse" | "http" | "streamable-http" => {
+                "sse" | "http" | "streamable-http" | "ws" | "wss" | "websocket" => {
                     if url.is_none() {
                         anyhow::bail!("{} transport requires --url", transport);
                     }
                 }
-                other => anyhow::bail!("unsupported transport '{}' (use stdio|sse|http)", other),
+                other => {
+                    anyhow::bail!("unsupported transport '{}' (use stdio|sse|http|ws)", other)
+                }
             }
             let cfg = McpServerConfig {
                 enabled: true,
@@ -1240,6 +1245,37 @@ async fn cmd_config(config: &Config, action: ConfigCommands) -> anyhow::Result<(
             println!("{}", serde_json::to_string_pretty(&serde_json::to_value(config)?)?);
         }
     }
+    Ok(())
+}
+
+async fn cmd_runs(db: Arc<HiveDb>) -> anyhow::Result<()> {
+    let mut runs = db.list(hivecyber_core::store::collections::COL_RUNS).await;
+    if runs.is_empty() {
+        println!("No hay runs todavía. Inicia una operación con `hivecyber chat` o `run`.");
+        return Ok(());
+    }
+    // Most recent first.
+    runs.sort_by(|a, b| {
+        let ka = a.1.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let kb = b.1.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        kb.cmp(ka)
+    });
+    println!(
+        "{:<38} {:<10} {:<12} {:<12} {:>4} {:>8}",
+        "RUN_ID", "STATUS", "AGENT", "KIND", "IT", "TOKENS"
+    );
+    for (id, r) in &runs {
+        println!(
+            "{:<38} {:<10} {:<12} {:<12} {:>4} {:>8}",
+            id,
+            r.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+            r.get("agent_id").and_then(|v| v.as_str()).unwrap_or(""),
+            r.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
+            r.get("iterations_used").and_then(|v| v.as_u64()).unwrap_or(0),
+            r.get("tokens_used").and_then(|v| v.as_u64()).unwrap_or(0),
+        );
+    }
+    println!("\nReanuda un run interrumpido con: hivecyber resume <RUN_ID>");
     Ok(())
 }
 

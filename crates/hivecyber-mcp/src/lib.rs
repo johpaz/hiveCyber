@@ -49,12 +49,26 @@ pub struct McpServerState {
     pub status: String,
     pub tools: Vec<McpTool>,
     pub last_error: Option<String>,
+    /// How many times we have reconnected this server (drives backoff).
+    pub reconnect_attempts: u32,
 }
 
 struct StdioConnection {
     child: Child,
     stdin: ChildStdin,
     stdout: Arc<Mutex<BufReader<ChildStdout>>>,
+}
+
+/// Persistent WebSocket transport. JSON-RPC messages are text frames; the reply
+/// is the next text frame carrying a JSON-RPC object (notifications without an
+/// id are skipped when waiting for a response).
+type WsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+struct WsConnection {
+    write: Mutex<futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>,
+    read: Mutex<futures::stream::SplitStream<WsStream>>,
 }
 
 /// Streamable-HTTP / SSE transport. Each JSON-RPC message is POSTed to the
@@ -71,6 +85,7 @@ struct HttpConnection {
 enum Transport {
     Stdio(Arc<Mutex<StdioConnection>>),
     Http(Arc<HttpConnection>),
+    Ws(Arc<WsConnection>),
 }
 
 pub struct McpClientManager {
@@ -97,6 +112,7 @@ impl McpClientManager {
                 status: "disconnected".into(),
                 tools: Vec::new(),
                 last_error: None,
+                reconnect_attempts: 0,
             },
         );
     }
@@ -157,6 +173,39 @@ impl McpClientManager {
                 };
                 self.conns
                     .insert(name.to_string(), Transport::Http(Arc::new(conn)));
+            }
+            "ws" | "wss" | "websocket" => {
+                use futures::StreamExt;
+                use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+                let url = config
+                    .url
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("websocket transport requires url"))?;
+                info!("MCP server '{}' connecting via websocket: {}", name, url);
+
+                let mut request = url
+                    .into_client_request()
+                    .with_context(|| format!("invalid ws url: {}", name))?;
+                for (k, v) in &config.headers {
+                    if let (Ok(hn), Ok(hv)) = (
+                        k.parse::<tokio_tungstenite::tungstenite::http::header::HeaderName>(),
+                        v.parse::<tokio_tungstenite::tungstenite::http::header::HeaderValue>(),
+                    ) {
+                        request.headers_mut().insert(hn, hv);
+                    }
+                }
+
+                let (stream, _resp) = tokio_tungstenite::connect_async(request)
+                    .await
+                    .with_context(|| format!("ws connect {}", name))?;
+                let (write, read) = stream.split();
+                let conn = WsConnection {
+                    write: Mutex::new(write),
+                    read: Mutex::new(read),
+                };
+                self.conns
+                    .insert(name.to_string(), Transport::Ws(Arc::new(conn)));
             }
             other => {
                 if let Some(state) = self.servers.get_mut(name) {
@@ -286,7 +335,19 @@ impl McpClientManager {
             }
         });
 
-        let resp = self.send_jsonrpc(server, &req).await?;
+        // On a transport failure over a persistent connection (stale stdio/ws
+        // session), reconnect once with backoff and retry the call.
+        let resp = match self.send_jsonrpc(server, &req).await {
+            Ok(r) => r,
+            Err(e) if self.is_persistent(server) => {
+                tracing::warn!("mcp '{}' call failed ({}); reconnecting…", server, e);
+                self.reconnect_server(server)
+                    .await
+                    .with_context(|| format!("reconnect {}", server))?;
+                self.send_jsonrpc(server, &req).await?
+            }
+            Err(e) => return Err(e),
+        };
 
         if let Some(err) = resp.get("error") {
             return Err(anyhow::anyhow!("mcp error: {}", err));
@@ -320,6 +381,7 @@ impl McpClientManager {
                 })
             }
             Transport::Http(conn) => http_send(conn, req).await,
+            Transport::Ws(conn) => ws_send(conn, req, true).await,
         }
     }
 
@@ -335,7 +397,40 @@ impl McpClientManager {
                 // Notifications carry no id; a 202/empty body is expected.
                 let _ = http_send(conn, req).await;
             }
+            Some(Transport::Ws(conn)) => {
+                // Notification: write only, do not wait for a response frame.
+                let _ = ws_send(conn, req, false).await;
+            }
             None => {}
+        }
+        Ok(())
+    }
+
+    /// Whether a transport is persistent (a dropped connection can be
+    /// re-established). HTTP is stateless per request, so it never needs one.
+    fn is_persistent(&self, server: &str) -> bool {
+        matches!(
+            self.conns.get(server),
+            Some(Transport::Stdio(_)) | Some(Transport::Ws(_))
+        )
+    }
+
+    /// Tear down and re-establish a server's connection with exponential backoff
+    /// (200ms · 2^attempt, capped at 5s). Used to recover a stale stdio/ws
+    /// session before retrying a call.
+    pub async fn reconnect_server(&mut self, name: &str) -> Result<()> {
+        let attempt = self.servers.get(name).map(|s| s.reconnect_attempts).unwrap_or(0);
+        let backoff_ms = std::cmp::min(5_000u64, 200u64 * 2u64.saturating_pow(attempt));
+        if let Some(state) = self.servers.get_mut(name) {
+            state.reconnect_attempts = attempt.saturating_add(1);
+            state.status = "reconnecting".into();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+
+        let _ = self.disconnect_server(name).await;
+        self.connect_server(name).await?;
+        if let Some(state) = self.servers.get_mut(name) {
+            state.reconnect_attempts = 0; // success resets the backoff
         }
         Ok(())
     }
@@ -352,6 +447,57 @@ impl McpClientManager {
 impl Default for McpClientManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Send one JSON-RPC message over the persistent WebSocket. When `wait` is true,
+/// read frames until a JSON-RPC response object arrives (skipping pings and
+/// server-initiated notifications); when false (a client notification), only
+/// write.
+async fn ws_send(
+    conn: &WsConnection,
+    req: &serde_json::Value,
+    wait: bool,
+) -> Result<serde_json::Value> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let json = serde_json::to_string(req)?;
+    {
+        let mut w = conn.write.lock().await;
+        w.send(WsMessage::text(json)).await.context("ws send")?;
+    }
+    if !wait {
+        return Ok(serde_json::Value::Null);
+    }
+
+    fn is_response(v: &serde_json::Value) -> bool {
+        v.get("id").is_some() || v.get("result").is_some() || v.get("error").is_some()
+    }
+
+    let mut r = conn.read.lock().await;
+    loop {
+        match r.next().await {
+            Some(Ok(WsMessage::Text(txt))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(txt.as_str()) {
+                    if is_response(&v) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Some(Ok(WsMessage::Binary(bin))) => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bin) {
+                    if is_response(&v) {
+                        return Ok(v);
+                    }
+                }
+            }
+            Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+            Some(Ok(WsMessage::Close(_))) => return Err(anyhow::anyhow!("ws closed by server")),
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(anyhow::anyhow!("ws read error: {}", e)),
+            None => return Err(anyhow::anyhow!("ws stream ended")),
+        }
     }
 }
 

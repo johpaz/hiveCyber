@@ -119,18 +119,26 @@ Formato mas expresivo que el allowlist plano, cargado con `--engagement-policy <
 {
   "program": "cliente-acme-q3-2026",
   "targets": [
-    { "host": "10.0.0.0/24", "paths": ["/**"], "methods": ["GET", "POST"] },
-    { "host": "app.example.com", "paths": ["/api/**"], "methods": ["GET"], "only_own_accounts": true }
+    { "host": "10.0.0.0/24", "paths": ["/**"], "methods": ["GET", "POST"], "rate_limit_rps": 5 },
+    { "host": "app.example.com", "paths": ["/api/**"], "methods": ["GET"], "only_own_accounts": true, "rate_limit_rps": 2 }
   ],
   "excluded": ["10.0.0.1", "admin.example.com"],
   "prohibited": ["denial_of_service", "social_engineering", "destructive_test"],
-  "require_human_approval": ["exploit", "credential_use"]
+  "require_human_approval": ["exploit", "credential_use"],
+  "time_windows": { "allowed_days": ["Mon", "Tue", "Wed", "Thu", "Fri"], "allowed_hours_utc": [22, 6] }
 }
 ```
 
 - `targets[].host` acepta host exacto, CIDR (`10.0.0.0/24`, `fe80::/10`) o subdominio (matching por sufijo seguro: `example.com` cubre `api.example.com` pero nunca `evil-example.com`).
 - `excluded` se evalua antes que `targets` y siempre gana — sirve para excluir un host/CIDR puntual dentro de un rango mas amplio.
 - `prohibited` / `require_human_approval` son chequeados por las tools de exploit antes de ejecutar (`is_prohibited`, `requires_approval`).
+- **`time_windows`** (aplicado en `validate_target`): `allowed_days` (nombres de día, `Mon`/`Monday`) y
+  `allowed_hours_utc` `[inicio, fin)` en UTC (envuelve pasada la medianoche si `inicio > fin`).
+  Fuera de la ventana, todo target se rechaza — p. ej. "solo probar de noche".
+- **`rate_limit_rps`** por target (aplicado en `validate_target`): límite **compartido process-global**
+  por `programa::host`, **fail-closed** (excederlo rechaza la petición en vez de encolarla, para no
+  inundar el objetivo). Cubre las tools de red in-process (recon/vuln/web); las tools sandboxeadas
+  corren en el subproceso worker con su propio contexto (un limiter cross-proceso queda como Roadmap).
 - Toda normalizacion de host (scheme, userinfo, puerto, mayusculas, IPv4 numerico/hex) pasa por `normalize_host()` — usado tanto por `EngagementPolicy` como por el allowlist plano legado, para que ambos caminos vean el mismo host normalizado.
 
 ## ToolMiddleware: auditoria obligatoria (`core/src/tool_runtime/middleware.rs`)
@@ -202,9 +210,19 @@ hivecyber agent enable exploit_operator
 
 Verifica el doc en HiveDB, setea `enabled=true`, `status=active`.
 
-## Audit log inmutable (`core/src/security/audit.rs`)
+## Audit log tamper-evident (`core/src/security/audit.rs`)
 
-Coleccion HiveDB `audit_log` con hash chain SHA-256:
+Coleccion HiveDB `audit_log` con hash chain SHA-256. Se describe como
+**tamper-evident** (cualquier alteración rompe el hash chain y `verify_chain` la
+detecta), no "inmutable": los ficheros del store no son de solo-lectura.
+
+**Append atómico:** `append_audit` toma un **lock global de auditoría** y hace
+`get_last_hash` + `log_audit` como sección crítica única. Sin él, dos workers
+concurrentes podían leer el mismo `prev_hash` y **bifurcar** la cadena. El
+`ToolMiddleware` usa exclusivamente `append_audit` (nunca `get_last_hash` +
+`log_audit` por separado). Nota: el lock es por-proceso; escritores en procesos
+distintos contra el mismo home requerirían un file lock del SO (fuera de alcance
+del runtime single-process).
 
 ```rust
 pub struct AuditLogEntry {

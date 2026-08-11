@@ -18,6 +18,18 @@ pub struct SecurityContext {
     pub allow_cli_exec: bool,
 }
 
+/// Process-global per-(program, host) last-request timestamps for rate limiting,
+/// shared across every in-process tool and SecurityContext — so all scanners
+/// together cannot exceed a target's configured rate. (Sandboxed exploit tools
+/// run in a separate worker process; a cross-process limiter would need shared
+/// IPC state, out of scope here.)
+fn rate_limiter() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static LIMITER: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 impl SecurityContext {
     pub fn validate_target(&self, target: &str) -> Result<(), String> {
         if !self.unsafe_mode {
@@ -38,6 +50,17 @@ impl SecurityContext {
                     policy.targets.len()
                 ));
             }
+            // Operating window (e.g. "solo fuera de horario laboral").
+            if !policy.is_within_window(chrono::Utc::now()) {
+                return Err(format!(
+                    "fuera de la ventana horaria autorizada del programa '{}'",
+                    policy.program
+                ));
+            }
+            // Per-target rate limit shared across in-process tools.
+            if let Some(rps) = policy.rate_limit_for(target) {
+                self.check_rate_limit(&policy.program, target, rps)?;
+            }
             return Ok(());
         }
         if !validate_target_in_allowlist(target, &self.allowlist_hosts) {
@@ -47,6 +70,32 @@ impl SecurityContext {
                 self.allowlist_hosts.len()
             ));
         }
+        Ok(())
+    }
+
+    /// Enforce a minimum interval (`1/rps`) between requests to a given
+    /// (program, host). Fail-closed: exceeding the rate is rejected rather than
+    /// queued, so agents never flood a bug-bounty target. Records the request
+    /// time on success.
+    fn check_rate_limit(&self, program: &str, target: &str, rps: f64) -> Result<(), String> {
+        if rps <= 0.0 {
+            return Ok(());
+        }
+        let min_interval = std::time::Duration::from_secs_f64(1.0 / rps);
+        let key = format!("{}::{}", program, crate::engagement::normalize_host(target));
+        let now = std::time::Instant::now();
+        let mut map = rate_limiter()
+            .lock()
+            .map_err(|_| "rate limiter lock poisoned".to_string())?;
+        if let Some(&last) = map.get(&key) {
+            if now.duration_since(last) < min_interval {
+                return Err(format!(
+                    "rate limit excedido para '{}' (máx {} req/s del programa)",
+                    target, rps
+                ));
+            }
+        }
+        map.insert(key, now);
         Ok(())
     }
 

@@ -3,12 +3,13 @@
 ## Resumen
 
 hiveCyber implementa MCP nativamente en Rust, sin depender del crate `rmcp`. El
-protocolo es JSON-RPC 2.0 con dos transportes: **stdio** (proceso hijo) y
-**streamable-HTTP / SSE** (`reqwest`, con eco de `Mcp-Session-Id`). Los servers se
-persisten en la colección `mcp_servers`, se conectan en el arranque de
-`chat`/`run`, y cada tool descubierta se expone al agente como una tool normal
-(`McpToolProxy`) que fluye por el tool-selector BM25. WebSocket queda como
-Roadmap.
+protocolo es JSON-RPC 2.0 con tres transportes: **stdio** (proceso hijo),
+**streamable-HTTP / SSE** (`reqwest`, con eco de `Mcp-Session-Id`) y **WebSocket**
+(`tokio-tungstenite` + rustls para `wss://`). Los servers se persisten en la
+colección `mcp_servers`, se conectan en el arranque de `chat`/`run`, y cada tool
+descubierta se expone al agente como una tool normal (`McpToolProxy`) que fluye
+por el tool-selector BM25. Las conexiones persistentes (stdio/ws) tienen
+**reconnect con backoff exponencial** ante una sesión caída.
 
 ## Arquitectura
 
@@ -59,6 +60,20 @@ request posterior. Transports admitidos: `sse`, `http`, `streamable-http`.
 Cubierto por el test de integración `crates/hivecyber-mcp/tests/sse_transport.rs`
 (servidor mock: initialize sobre SSE + session id, tools/list como JSON, tools/call).
 
+### WebSocket
+Conexión persistente vía `tokio-tungstenite` (rustls habilita `wss://`; los
+`headers` de config se envían en el handshake). Cada request es un frame de texto;
+la respuesta es el siguiente frame JSON-RPC (se saltan pings y notificaciones
+server→cliente). Transports admitidos: `ws`, `wss`, `websocket`. Cubierto por
+`crates/hivecyber-mcp/tests/ws_transport.rs` (servidor WS real).
+
+### Reconnect con backoff
+`call_tool` sobre un transporte persistente (stdio/ws) que falla por sesión caída
+dispara `reconnect_server`: desconecta, espera `min(5s, 200ms·2^intentos)`,
+reconecta (re-`initialize` + `tools/list`) y reintenta la llamada una vez. Un
+reconnect exitoso resetea `reconnect_attempts`. HTTP es stateless por request, así
+que no necesita reconnect.
+
 ## Protocolo JSON-RPC 2.0
 
 `initialize` → `notifications/initialized` → `tools/list` en connect;
@@ -96,6 +111,9 @@ hivecyber mcp add fs --transport stdio --command npx \
 # sse / streamable-http
 hivecyber mcp add remote --transport sse --url https://api.example.com/mcp \
   --header "Authorization=Bearer token123"
+# websocket
+hivecyber mcp add wsrv --transport ws --url wss://api.example.com/mcp \
+  --header "Authorization=Bearer token123"
 
 hivecyber mcp list                 # servers registrados + status
 hivecyber mcp connect <name>       # conecta y lista sus tools
@@ -114,8 +132,8 @@ corto). Las conexiones persistentes viven durante una sesión `chat`/`run`.
 |---|---|
 | `@modelcontextprotocol/sdk` | Implementación nativa JSON-RPC |
 | SSE transport (`transports/sse.ts`) | Implementado (`reqwest`, session id) |
-| WebSocket transport (`transports/websocket.ts`) | Roadmap (`tokio-tungstenite` presente) |
+| WebSocket transport (`transports/websocket.ts`) | Implementado (`tokio-tungstenite` + rustls) |
 | tool-sync al índice de capacidades | `McpToolProxy` en el `ToolRegistry` → BM25 |
 | Lazy connect on-demand 8s | Connect en boot de `chat`/`run` |
-| Reconnect stale-session | Roadmap |
+| Reconnect stale-session | Implementado (backoff exponencial, 1 reintento) |
 | Hot-reload de config | Roadmap |

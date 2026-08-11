@@ -13,6 +13,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
-tokio-tungstenite = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots", "connect"] }
 futures = { workspace = true }
 reqwest = { workspace = true }

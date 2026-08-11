@@ -2,7 +2,7 @@
 
 hiveCyber es un **harness de ciberseguridad con agentes de larga duración**: un
 coordinador (Caelum) delega en 8 workers especializados, con acceptance checks
-deterministas, audit log inmutable (hash-chain SHA-256) y sandbox seccomp para las
+deterministas, audit log tamper-evident (hash-chain SHA-256) y sandbox seccomp para las
 tools ofensivas. Está diseñado para **contextos autorizados**: pentesting con alcance,
 defensa, DFIR, investigación y educación.
 

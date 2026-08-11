@@ -92,6 +92,45 @@ impl EngagementPolicy {
         }
     }
 
+    /// Whether `now` falls within the program's authorized operating window.
+    /// No window configured → always allowed. `allowed_days` matches weekday
+    /// names (case-insensitive, `Mon`/`Monday` both work); `allowed_hours_utc`
+    /// is a `[start, end)` UTC hour range (wraps past midnight when start > end).
+    pub fn is_within_window(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::{Datelike, Timelike};
+        let Some(tw) = &self.time_windows else {
+            return true;
+        };
+        if !tw.allowed_days.is_empty() {
+            let today = format!("{:?}", now.weekday()).to_lowercase(); // "mon", "tue", …
+            let ok = tw.allowed_days.iter().any(|d| {
+                let d = d.trim().to_lowercase();
+                !d.is_empty() && (d.starts_with(&today) || today.starts_with(&d))
+            });
+            if !ok {
+                return false;
+            }
+        }
+        if let Some((start, end)) = tw.allowed_hours_utc {
+            let h = now.hour();
+            let in_hours = if start <= end {
+                h >= start && h < end
+            } else {
+                h >= start || h < end
+            };
+            if !in_hours {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The rate limit (requests/sec) configured for the rule matching `target`,
+    /// if any.
+    pub fn rate_limit_for(&self, target: &str) -> Option<f64> {
+        self.target_allowed(target).rule.and_then(|r| r.rate_limit_rps)
+    }
+
     pub fn target_allowed(&self, raw_target: &str) -> MatchOutcome<'_> {
         let norm = normalize_host(raw_target);
         if norm.is_empty() {
@@ -434,6 +473,65 @@ mod tests {
     fn target_allowed_empty_policy_matches_nothing() {
         let policy = EngagementPolicy::empty();
         assert!(policy.target_allowed("example.com").rule.is_none());
+    }
+
+    // -- time windows ---------------------------------------------------------
+
+    #[test]
+    fn time_window_none_always_allows() {
+        let policy = EngagementPolicy::default();
+        let t = chrono::DateTime::parse_from_rfc3339("2026-01-05T14:00:00Z").unwrap().to_utc();
+        assert!(policy.is_within_window(t));
+    }
+
+    #[test]
+    fn time_window_enforces_hours_and_days() {
+        // 2026-01-05 is a Monday.
+        let monday_14 = chrono::DateTime::parse_from_rfc3339("2026-01-05T14:00:00Z").unwrap().to_utc();
+        let monday_20 = chrono::DateTime::parse_from_rfc3339("2026-01-05T20:00:00Z").unwrap().to_utc();
+        let sunday_14 = chrono::DateTime::parse_from_rfc3339("2026-01-04T14:00:00Z").unwrap().to_utc();
+
+        let policy = EngagementPolicy {
+            time_windows: Some(TimeWindow {
+                allowed_days: vec!["Mon".into(), "Tue".into()],
+                allowed_hours_utc: Some((9, 17)),
+            }),
+            ..Default::default()
+        };
+        assert!(policy.is_within_window(monday_14), "Mon 14:00 in [9,17) is allowed");
+        assert!(!policy.is_within_window(monday_20), "Mon 20:00 outside hours");
+        assert!(!policy.is_within_window(sunday_14), "Sunday not in allowed days");
+    }
+
+    #[test]
+    fn time_window_hours_wrap_past_midnight() {
+        // Overnight window 22:00–06:00 (start > end).
+        let policy = EngagementPolicy {
+            time_windows: Some(TimeWindow { allowed_days: vec![], allowed_hours_utc: Some((22, 6)) }),
+            ..Default::default()
+        };
+        let t23 = chrono::DateTime::parse_from_rfc3339("2026-01-05T23:00:00Z").unwrap().to_utc();
+        let t03 = chrono::DateTime::parse_from_rfc3339("2026-01-05T03:00:00Z").unwrap().to_utc();
+        let t12 = chrono::DateTime::parse_from_rfc3339("2026-01-05T12:00:00Z").unwrap().to_utc();
+        assert!(policy.is_within_window(t23));
+        assert!(policy.is_within_window(t03));
+        assert!(!policy.is_within_window(t12));
+    }
+
+    #[test]
+    fn rate_limit_for_returns_rule_value() {
+        let policy = EngagementPolicy {
+            targets: vec![TargetRule {
+                host: "example.com".into(),
+                paths: vec!["/**".into()],
+                methods: vec!["GET".into()],
+                rate_limit_rps: Some(5.0),
+                only_own_accounts: false,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(policy.rate_limit_for("example.com"), Some(5.0));
+        assert_eq!(policy.rate_limit_for("other.com"), None);
     }
 
     // -- request_allowed ------------------------------------------------------

@@ -91,4 +91,4 @@ Binario dedicado sandboxed:
 2. **Per-operation timeouts, not aggregate**: LLM call (3min), tool execution (per-tool timeoutMs), MCP lazy connect (8s)
 3. **Context engineering**: minimal tool loadout (7 base tools), selective history (last 15), compaction (0.80 threshold), TOON encoding (pendiente)
 4. **Delegation model**: `task_delegate` produce sibling jobs que comparten `turn_id`; coordinator finaliza su turno mientras workers corren en paralelo; fan-in al cerrar grupo
-5. **Politicas estrictas cybersec**: auto-pause @ 3 harmful > helpful; auto-disable @ 5; allowlist obligatoria para exploit; audit log inmutable; sesion timeout 15min
+5. **Politicas estrictas cybersec**: auto-pause @ 3 harmful > helpful; auto-disable @ 5; allowlist obligatoria para exploit; audit log tamper-evident; sesion timeout 15min

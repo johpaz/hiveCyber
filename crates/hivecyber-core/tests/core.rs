@@ -1068,3 +1068,74 @@ async fn test_resolve_context_budget_from_catalog() {
     // Catalog is the full Hive mirror.
     assert!(model_catalog().len() >= 80);
 }
+
+// ---- Durable coordinator run: ensure / checkpoint / interrupt ----
+
+#[tokio::test]
+async fn test_run_lifecycle_ensure_checkpoint_interrupt() {
+    use hivecyber_core::agent::run_store;
+
+    let db = temp_db().await;
+
+    // First ensure creates a running run for the thread.
+    let rid = run_store::ensure_run(&db, "chat", "caelum", "th-1", serde_json::json!({"message":"go"}))
+        .await
+        .unwrap();
+    let r = db.get(COL_RUNS, &rid).await.unwrap();
+    assert_eq!(r.get("status").and_then(|v| v.as_str()), Some("running"));
+
+    // Second ensure for the same thread reuses the same run (no duplicate).
+    let rid2 = run_store::ensure_run(&db, "chat", "caelum", "th-1", serde_json::json!({"message":"again"}))
+        .await
+        .unwrap();
+    assert_eq!(rid, rid2, "same thread reuses its run");
+    let all: Vec<_> = db.list(COL_RUNS).await;
+    assert_eq!(all.len(), 1);
+
+    // Checkpoint updates counters + lease.
+    run_store::checkpoint_run(&db, &rid, 3, 1234, serde_json::json!({"turn":3})).await.unwrap();
+    let r = db.get(COL_RUNS, &rid).await.unwrap();
+    assert_eq!(r.get("iterations_used").and_then(|v| v.as_u64()), Some(3));
+    assert_eq!(r.get("tokens_used").and_then(|v| v.as_u64()), Some(1234));
+    assert!(r.get("lease_expires_at").and_then(|v| v.as_str()).is_some());
+
+    // Interrupt marks it resumable.
+    run_store::interrupt_run(&db, &rid).await.unwrap();
+    let r = db.get(COL_RUNS, &rid).await.unwrap();
+    assert_eq!(r.get("status").and_then(|v| v.as_str()), Some("interrupted"));
+
+    // A fresh ensure for the same thread reactivates the interrupted run.
+    let rid3 = run_store::ensure_run(&db, "chat", "caelum", "th-1", serde_json::json!({})).await.unwrap();
+    assert_eq!(rid, rid3);
+    assert_eq!(db.get(COL_RUNS, &rid).await.unwrap().get("status").and_then(|v| v.as_str()), Some("running"));
+}
+
+// ---- Audit chain: atomic append under concurrency (no forks) ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_audit_append_is_atomic_under_concurrency() {
+    use hivecyber_core::security::audit;
+
+    let db = temp_db().await;
+
+    // Many concurrent writers hammering the chain. Without the global audit lock
+    // several would read the same prev_hash and fork it.
+    let mut handles = Vec::new();
+    for i in 0..64 {
+        let db = db.clone();
+        handles.push(tokio::spawn(async move {
+            audit::append_audit(&db, "nmap", &format!("10.0.0.{}", i), "recon_operator", "run-x", "op1")
+                .await
+                .unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let entries = db.list(COL_AUDIT_LOG).await;
+    assert_eq!(entries.len(), 64, "all appends persisted");
+
+    let (ok, errors) = audit::verify_chain(&db).await.unwrap();
+    assert!(ok, "chain must stay linear under concurrency; errors: {:?}", errors);
+}

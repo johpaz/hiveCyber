@@ -102,15 +102,15 @@ impl ToolMiddleware {
         target: &str,
         outcome: &ToolOutcome,
     ) -> Result<()> {
-        let prev = audit::get_last_hash(&self.db).await;
-        let _new = audit::log_audit(
+        // Atomic read-head + append under the global audit lock, so concurrent
+        // tool executions can never fork the tamper-evident chain.
+        let _new = audit::append_audit(
             &self.db,
             tool_name,
             target,
             &ctx.worker,
             &ctx.run_id,
             &ctx.operator_id,
-            &prev,
         )
         .await?;
         tracing::debug!(
