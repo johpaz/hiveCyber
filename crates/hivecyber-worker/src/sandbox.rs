@@ -102,11 +102,22 @@ fn set_no_new_privs() -> Result<()> {
 // rlimits
 // -----------------------------------------------------------------------------
 
+// musl's setrlimit()/getrlimit() take a plain `c_int` resource id; glibc's
+// take `__rlimit_resource_t` (== c_uint) — the exact same parameter has a
+// different type per libc environment (confirmed against the `libc` crate's
+// own `cfg_if!` on `target_env` for the RLIMIT_* constants). Alias to
+// whichever this target's libc actually expects so `set()` below type-checks
+// against both.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"), target_env = "musl"))]
+type RlimitResource = libc::c_int;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"), not(target_env = "musl")))]
+type RlimitResource = libc::__rlimit_resource_t;
+
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn apply_rlimits() -> Result<()> {
     use libc::{setrlimit, rlimit};
 
-    fn set(res: libc::__rlimit_resource_t, soft: u64, hard: u64, label: &str) -> Result<()> {
+    fn set(res: RlimitResource, soft: u64, hard: u64, label: &str) -> Result<()> {
         let rl = rlimit {
             rlim_cur: soft,
             rlim_max: hard,
@@ -313,7 +324,6 @@ fn kill_syscalls_list() -> Vec<i64> {
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
-        libc::SYS_kexec_file_load,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
         libc::SYS_pivot_root,
@@ -331,6 +341,12 @@ fn kill_syscalls_list() -> Vec<i64> {
     // kill on an architecture that has no such syscall to begin with.
     #[cfg(target_arch = "x86_64")]
     v.extend([libc::SYS_iopl, libc::SYS_ioperm]);
+    // kexec_file_load: present for x86_64 (gnu+musl) and aarch64-gnu, but
+    // musl's aarch64 syscall table doesn't define this constant at all
+    // (verified against the `libc` crate source — not present in
+    // linux/musl/b64/aarch64/mod.rs, unlike every other target combo here).
+    #[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
+    v.push(libc::SYS_kexec_file_load);
     v
 }
 
