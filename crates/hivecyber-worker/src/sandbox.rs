@@ -20,15 +20,16 @@
 //! `SECCOMP_RET_ERRNO(EPERM)` for everything not in the allowlist.
 
 use anyhow::Result;
-// `Context` is only used by the Linux syscall wrappers below.
-#[cfg(target_os = "linux")]
+// `Context` is only used by the Linux syscall wrappers below, which only
+// compile for the architectures the seccomp allowlist actually supports.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use anyhow::Context;
 
 // -----------------------------------------------------------------------------
 // Public entry point
 // -----------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn apply_sandbox() -> Result<()> {
     tracing::info!("applying Linux sandbox (no_new_privs + rlimits + caps + namespaces + seccomp)");
 
@@ -43,27 +44,42 @@ pub fn apply_sandbox() -> Result<()> {
     Ok(())
 }
 
+// Linux, but not one of the two architectures the seccomp allowlist is built
+// and tested for (x86_64, aarch64 — see kill_syscalls_list/allow_syscalls_list,
+// which reference real per-arch syscall numbers via the `libc` crate). Rather
+// than fabricate an allowlist for an unverified architecture, fail closed like
+// the non-Linux path below.
+#[cfg(all(target_os = "linux", not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+pub fn apply_sandbox() -> Result<()> {
+    fail_closed(&format!(
+        "worker sandbox not implemented for {} on Linux (only x86_64 and aarch64 are supported)",
+        std::env::consts::ARCH
+    ))
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn apply_sandbox() -> Result<()> {
-    // No kernel sandbox on this platform. Fail closed by default so exploit
-    // tools are refused rather than silently running unconfined. Operators who
-    // accept the risk opt in explicitly (mirrors the middleware's gate; this is
-    // defense in depth in case the worker is invoked directly).
-    let os = std::env::consts::OS;
+    fail_closed(&format!("worker sandbox unavailable on {}", std::env::consts::OS))
+}
+
+// Shared fail-closed behavior for platforms/architectures without a real
+// sandbox implementation: refuse sandboxed (exploit) tools by default so they
+// never run unconfined silently. Operators who accept the risk opt in
+// explicitly (mirrors the middleware's gate; this is defense in depth in case
+// the worker is invoked directly).
+#[cfg(any(not(target_os = "linux"), not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn fail_closed(context: &str) -> Result<()> {
     let opted_in = std::env::var("HIVECYBER_ALLOW_UNSANDBOXED")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if opted_in {
-        tracing::warn!(
-            "sandbox unavailable on {} but HIVECYBER_ALLOW_UNSANDBOXED=1 — running UNCONFINED",
-            os
-        );
+        tracing::warn!("{} but HIVECYBER_ALLOW_UNSANDBOXED=1 — running UNCONFINED", context);
         return Ok(());
     }
     Err(anyhow::anyhow!(
-        "worker sandbox unavailable on {} — refusing to run sandboxed (exploit) tools. \
-         Use the Linux Docker image, or set HIVECYBER_ALLOW_UNSANDBOXED=1 to override (unsafe).",
-        os
+        "{} — refusing to run sandboxed (exploit) tools. Use the Linux/x86_64 or Linux/aarch64 \
+         Docker image, or set HIVECYBER_ALLOW_UNSANDBOXED=1 to override (unsafe).",
+        context
     ))
 }
 
@@ -71,7 +87,7 @@ pub fn apply_sandbox() -> Result<()> {
 // PR_SET_NO_NEW_PRIVS
 // -----------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn set_no_new_privs() -> Result<()> {
     const PR_SET_NO_NEW_PRIVS: i32 = 38;
     let rc = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -86,7 +102,7 @@ fn set_no_new_privs() -> Result<()> {
 // rlimits
 // -----------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn apply_rlimits() -> Result<()> {
     use libc::{setrlimit, rlimit};
 
@@ -137,7 +153,7 @@ fn apply_rlimits() -> Result<()> {
 /// the whole system, by scanning `/proc/*/status`. Best-effort: returns
 /// `None` on any read error rather than guessing, so the caller can skip
 /// clamping RLIMIT_NPROC instead of picking an unsafe value.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn current_uid_task_count() -> Option<u64> {
     let my_uid = unsafe { libc::getuid() };
     let mut total: u64 = 0;
@@ -174,7 +190,7 @@ fn current_uid_task_count() -> Option<u64> {
 // capabilities
 // -----------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn drop_capabilities() -> Result<()> {
     use caps::CapSet;
 
@@ -196,7 +212,7 @@ fn drop_capabilities() -> Result<()> {
 // namespaces
 // -----------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn try_namespaces() -> Result<()> {
     use libc::CLONE_NEWNS;
     const CLONE_NEWUSER: i32 = 0x10000000;
@@ -231,7 +247,7 @@ fn try_namespaces() -> Result<()> {
 // seccomp
 // -----------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod seccomp_bpf {
     use libc::{c_int, sock_filter, sock_fprog};
 
@@ -251,6 +267,19 @@ mod seccomp_bpf {
     // never matched the real value the kernel provides — every syscall was
     // killed at the wrong-arch check before the allowlist was ever consulted.
     pub const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
+    // EM_AARCH64 (183 = 0xb7) | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE, per
+    // linux/elf-em.h + linux/audit.h — same formula as AUDIT_ARCH_X86_64
+    // above (regression-tested against a real kernel). Not independently
+    // exercised on real aarch64 hardware in this repo's dev/CI environment;
+    // if seccomp ever misbehaves specifically on aarch64, re-verify this
+    // constant against `/usr/include/linux/audit.h` on real hardware first.
+    pub const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+
+    #[cfg(target_arch = "x86_64")]
+    pub const CURRENT_AUDIT_ARCH: u32 = AUDIT_ARCH_X86_64;
+    #[cfg(target_arch = "aarch64")]
+    pub const CURRENT_AUDIT_ARCH: u32 = AUDIT_ARCH_AARCH64;
 
     pub const SECCOMP_NR_OFF: u32 = 0;
     pub const SECCOMP_ARCH_OFF: u32 = 4;
@@ -275,17 +304,15 @@ mod seccomp_bpf {
 }
 
 // syscalls that must be killed outright (irreversible / privilege bricking)
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn kill_syscalls_list() -> Vec<i64> {
-    vec![
+    let mut v = vec![
         libc::SYS_ptrace,
         libc::SYS_kexec_load,
         libc::SYS_reboot,
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
-        libc::SYS_iopl,
-        libc::SYS_ioperm,
         libc::SYS_kexec_file_load,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
@@ -298,17 +325,30 @@ fn kill_syscalls_list() -> Vec<i64> {
         libc::SYS_keyctl,
         libc::SYS_request_key,
         libc::SYS_add_key,
-    ]
+    ];
+    // iopl/ioperm: x86 port-I/O privilege syscalls. Their syscall numbers
+    // don't exist on aarch64 (no legacy port-mapped I/O there) — nothing to
+    // kill on an architecture that has no such syscall to begin with.
+    #[cfg(target_arch = "x86_64")]
+    v.extend([libc::SYS_iopl, libc::SYS_ioperm]);
+    v
 }
 
 // syscalls allowed for normal operation
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn allow_syscalls_list() -> Vec<i64> {
-    vec![
-        libc::SYS_read, libc::SYS_write, libc::SYS_close, libc::SYS_stat,
-        libc::SYS_fstat, libc::SYS_lstat, libc::SYS_lseek, libc::SYS_mmap,
+    // Base list: syscalls with real numbers on BOTH x86_64 and aarch64. aarch64
+    // (and the "generic" 64-bit syscall ABI it introduced) dropped ~20 legacy
+    // syscalls in favor of their `*at()`/modern replacements, which is why this
+    // is a single shared base plus x86_64-only extras below, rather than one
+    // flat list — the dropped names don't exist as `libc::SYS_*` constants for
+    // aarch64 at all, so referencing them unconditionally fails to compile
+    // there (verified against the `libc` crate's aarch64 syscall tables).
+    let mut v = vec![
+        libc::SYS_read, libc::SYS_write, libc::SYS_close,
+        libc::SYS_fstat, libc::SYS_lseek, libc::SYS_mmap,
         // glibc's stat()/lstat()/fstatat()/access() wrappers prefer statx(2)
-        // and newfstatat/faccessat2 over the legacy syscalls above on modern
+        // and newfstatat/faccessat2 over the legacy syscalls on modern
         // kernels. Without these, tokio::fs::metadata() and friends fail
         // with EPERM — which callers like fs_exists silently read as "file
         // does not exist" instead of a hard error. Found via `fs_exists`
@@ -319,23 +359,22 @@ fn allow_syscalls_list() -> Vec<i64> {
         libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
         libc::SYS_rt_sigpending, libc::SYS_rt_sigsuspend,
         libc::SYS_ioctl, libc::SYS_pread64, libc::SYS_pwrite64,
-        libc::SYS_readv, libc::SYS_writev, libc::SYS_access, libc::SYS_pipe,
-        libc::SYS_pipe2, libc::SYS_select, libc::SYS_pselect6, libc::SYS_poll,
-        libc::SYS_ppoll, libc::SYS_epoll_create1, libc::SYS_epoll_create,
-        libc::SYS_epoll_ctl, libc::SYS_epoll_wait, libc::SYS_epoll_pwait,
+        libc::SYS_readv, libc::SYS_writev,
+        libc::SYS_pipe2, libc::SYS_pselect6,
+        libc::SYS_ppoll, libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl, libc::SYS_epoll_pwait,
         libc::SYS_eventfd2, libc::SYS_timerfd_create, libc::SYS_timerfd_settime,
         libc::SYS_timerfd_gettime, libc::SYS_signalfd4, libc::SYS_dup,
-        libc::SYS_dup2, libc::SYS_dup3, libc::SYS_fcntl, libc::SYS_flock,
+        libc::SYS_dup3, libc::SYS_fcntl, libc::SYS_flock,
         libc::SYS_fsync, libc::SYS_fdatasync, libc::SYS_truncate,
-        libc::SYS_ftruncate, libc::SYS_getdents64, libc::SYS_getdents,
-        libc::SYS_getcwd, libc::SYS_chdir, libc::SYS_fchdir, libc::SYS_rename,
-        libc::SYS_renameat, libc::SYS_renameat2, libc::SYS_mkdir, libc::SYS_mkdirat,
-        libc::SYS_rmdir, libc::SYS_creat, libc::SYS_open, libc::SYS_openat,
-        libc::SYS_unlink, libc::SYS_unlinkat, libc::SYS_readlink,
-        libc::SYS_readlinkat, libc::SYS_symlinkat, libc::SYS_linkat,
-        libc::SYS_chmod, libc::SYS_fchmod, libc::SYS_fchmodat,
-        libc::SYS_chown, libc::SYS_fchown, libc::SYS_fchownat, libc::SYS_lchown,
-        libc::SYS_getpid, libc::SYS_getppid, libc::SYS_getpgrp,
+        libc::SYS_ftruncate, libc::SYS_getdents64,
+        libc::SYS_getcwd, libc::SYS_chdir, libc::SYS_fchdir,
+        libc::SYS_renameat, libc::SYS_renameat2, libc::SYS_mkdirat,
+        libc::SYS_openat,
+        libc::SYS_unlinkat, libc::SYS_readlinkat, libc::SYS_symlinkat, libc::SYS_linkat,
+        libc::SYS_fchmod, libc::SYS_fchmodat,
+        libc::SYS_fchown, libc::SYS_fchownat,
+        libc::SYS_getpid, libc::SYS_getppid,
         libc::SYS_getuid, libc::SYS_getgid, libc::SYS_geteuid, libc::SYS_getegid,
         libc::SYS_getgroups,
         libc::SYS_socket, libc::SYS_connect, libc::SYS_accept, libc::SYS_accept4,
@@ -346,13 +385,13 @@ fn allow_syscalls_list() -> Vec<i64> {
         libc::SYS_sendfile, libc::SYS_sendmmsg, libc::SYS_recvmmsg,
         libc::SYS_clone, libc::SYS_clone3, libc::SYS_execve, libc::SYS_execveat,
         libc::SYS_wait4, libc::SYS_nanosleep, libc::SYS_clock_gettime,
-        libc::SYS_clock_nanosleep, libc::SYS_gettimeofday, libc::SYS_time,
+        libc::SYS_clock_nanosleep, libc::SYS_gettimeofday,
         libc::SYS_set_tid_address, libc::SYS_set_robust_list, libc::SYS_get_robust_list,
         libc::SYS_sched_yield, libc::SYS_sched_getaffinity, libc::SYS_sched_setscheduler,
         libc::SYS_sched_getscheduler, libc::SYS_sched_getparam, libc::SYS_sched_get_priority_max,
         libc::SYS_sched_get_priority_min,
         libc::SYS_exit, libc::SYS_exit_group, libc::SYS_futex,
-        libc::SYS_getrandom, libc::SYS_prctl, libc::SYS_arch_prctl,
+        libc::SYS_getrandom, libc::SYS_prctl,
         libc::SYS_uname, libc::SYS_getrlimit, libc::SYS_getrusage,
         libc::SYS_sysinfo, libc::SYS_times,
         // glibc >= 2.35 registers a restartable sequence for every new
@@ -360,7 +399,32 @@ fn allow_syscalls_list() -> Vec<i64> {
         // this the process gets an unconditional "Fatal glibc error: rseq
         // registration failed" (SIGABRT) on the very first thread it spawns.
         libc::SYS_rseq, libc::SYS_gettid,
-    ]
+    ];
+
+    // x86_64-only: legacy syscalls superseded by their `*at()`/modern
+    // equivalents above (openat, statx/newfstatat, faccessat[2], pipe2,
+    // pselect6, ppoll, epoll_create1, epoll_pwait, dup3, getdents64,
+    // renameat[2], mkdirat, unlinkat, readlinkat, fchmodat, fchownat — all
+    // already in the base list) but still valid, allocated syscall numbers on
+    // x86_64, so kept for any glibc code path that still calls them there.
+    // None of these exist on aarch64 at all (the generic 64-bit syscall ABI
+    // aarch64 introduced dropped them outright) — referencing them
+    // unconditionally is exactly what broke the aarch64 cross-compile.
+    // `arch_prctl` is a distinct case: genuinely x86(_64)-only (sets the
+    // FS/GS segment base registers for TLS), with no aarch64 syscall
+    // equivalent at all — TLS setup there uses a dedicated register, not a
+    // syscall this allowlist needs to cover.
+    #[cfg(target_arch = "x86_64")]
+    v.extend([
+        libc::SYS_stat, libc::SYS_lstat, libc::SYS_access, libc::SYS_pipe,
+        libc::SYS_select, libc::SYS_poll, libc::SYS_epoll_create, libc::SYS_epoll_wait,
+        libc::SYS_dup2, libc::SYS_getdents, libc::SYS_rename, libc::SYS_mkdir,
+        libc::SYS_rmdir, libc::SYS_creat, libc::SYS_open, libc::SYS_unlink,
+        libc::SYS_readlink, libc::SYS_chmod, libc::SYS_chown, libc::SYS_lchown,
+        libc::SYS_getpgrp, libc::SYS_time, libc::SYS_arch_prctl,
+    ]);
+
+    v
 }
 
 /// Builds the seccomp cBPF allowlist program (pure — no syscalls, testable).
@@ -387,7 +451,7 @@ fn allow_syscalls_list() -> Vec<i64> {
 /// EPERM default, killing the worker on its first syscall regardless of
 /// which syscall it was. `test_unmatched_syscall_gets_errno_not_kill` pins
 /// this down.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn build_seccomp_program(kill_syscalls: &[i64], allow_syscalls: &[i64]) -> Vec<libc::sock_filter> {
     use seccomp_bpf::*;
     use libc::sock_filter;
@@ -403,7 +467,7 @@ fn build_seccomp_program(kill_syscalls: &[i64], allow_syscalls: &[i64]) -> Vec<l
     let mut prog: Vec<sock_filter> = Vec::with_capacity(cap);
 
     prog.push(insn(BPF_LD_W_ABS, 0, 0, SECCOMP_ARCH_OFF));
-    prog.push(insn(BPF_JMP_JEQ_K, 1, 0, AUDIT_ARCH_X86_64));
+    prog.push(insn(BPF_JMP_JEQ_K, 1, 0, CURRENT_AUDIT_ARCH));
     prog.push(insn(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS));
     prog.push(insn(BPF_LD_W_ABS, 0, 0, SECCOMP_NR_OFF));
 
@@ -423,7 +487,7 @@ fn build_seccomp_program(kill_syscalls: &[i64], allow_syscalls: &[i64]) -> Vec<l
     prog
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn apply_seccomp_filter() -> Result<()> {
     let kill_syscalls = kill_syscalls_list();
     let allow_syscalls = allow_syscalls_list();
@@ -441,7 +505,7 @@ fn apply_seccomp_filter() -> Result<()> {
 // landlock (best-effort)
 // -----------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn try_landlock() -> Result<()> {
     // Minimal probe: call landlock_create_ruleset via libc::syscall with a
     // null attr and unsupported size. If it returns -1 with ENOSYS or EOPNOTSUPP,
@@ -462,7 +526,7 @@ fn try_landlock() -> Result<()> {
 // tests
 // -----------------------------------------------------------------------------
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::*;
 
@@ -503,6 +567,8 @@ mod tests {
         // 0xc0000000 (missing the machine-type byte) and silently killed
         // every syscall at the arch check before the allowlist ever ran.
         assert_eq!(seccomp_bpf::AUDIT_ARCH_X86_64, 0xc000_003e);
+        // EM_AARCH64(0xb7) | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE.
+        assert_eq!(seccomp_bpf::AUDIT_ARCH_AARCH64, 0xc000_00b7);
     }
 
     #[test]
@@ -517,7 +583,7 @@ mod tests {
         let allow = allow_syscalls_list();
         let prog = build_seccomp_program(&kill_syscalls_list(), &allow);
         for &sc in &allow {
-            let action = run_program(&prog, sc, seccomp_bpf::AUDIT_ARCH_X86_64);
+            let action = run_program(&prog, sc, seccomp_bpf::CURRENT_AUDIT_ARCH);
             assert_eq!(
                 action,
                 seccomp_bpf::SECCOMP_RET_ALLOW,
@@ -533,7 +599,7 @@ mod tests {
         let kill = kill_syscalls_list();
         let prog = build_seccomp_program(&kill, &allow_syscalls_list());
         for &sc in &kill {
-            let action = run_program(&prog, sc, seccomp_bpf::AUDIT_ARCH_X86_64);
+            let action = run_program(&prog, sc, seccomp_bpf::CURRENT_AUDIT_ARCH);
             assert_eq!(
                 action,
                 seccomp_bpf::SECCOMP_RET_KILL_PROCESS,
@@ -554,7 +620,7 @@ mod tests {
         assert!(!kill_syscalls_list().contains(&unmatched));
         assert!(!allow_syscalls_list().contains(&unmatched));
 
-        let action = run_program(&prog, unmatched, seccomp_bpf::AUDIT_ARCH_X86_64);
+        let action = run_program(&prog, unmatched, seccomp_bpf::CURRENT_AUDIT_ARCH);
         assert_eq!(action, seccomp_bpf::SECCOMP_RET_ERRNO | seccomp_bpf::EPERM);
     }
 
