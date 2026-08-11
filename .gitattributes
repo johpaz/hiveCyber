@@ -1,0 +1,18 @@
+# Force LF line endings for text files regardless of the checkout OS.
+# Without this, `git checkout` on Windows (default core.autocrlf=true) converts
+# LF → CRLF, which used to break the SKILL.md frontmatter parser — fixed to be
+# CRLF-tolerant too (see crates/hivecyber-skills/src/lib.rs), but keeping repo
+# content byte-consistent across OSes avoids this whole class of bug.
+* text=auto eol=lf
+
+*.rs text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+
+# Windows batch/PowerShell scripts, if any, keep native CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf

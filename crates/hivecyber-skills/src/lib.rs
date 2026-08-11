@@ -106,7 +106,12 @@ impl SkillLoader {
     }
 
     fn load_skill_file(&self, path: &Path, source: &str) -> Result<Skill> {
-        let content = std::fs::read_to_string(path).context("read skill file")?;
+        let raw = std::fs::read_to_string(path).context("read skill file")?;
+        // Normalize CRLF → LF before parsing. A SKILL.md checked out on Windows
+        // (git's default core.autocrlf converts LF→CRLF) or authored there via
+        // `skills add` would otherwise fail the frontmatter regex below, which
+        // matches a literal `\n` — `---\r\n` never matches `^---\n`.
+        let content = raw.replace("\r\n", "\n");
 
         let re = Regex::new(r"(?s)^---\n(.*?)\n---\n(.*)$").unwrap();
         let caps = re
@@ -132,5 +137,48 @@ impl SkillLoader {
         let mut skills: Vec<&Skill> = self.cache.values().collect();
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         skills
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduces the Windows CI failure: git checks out repo files with CRLF
+    /// (default `core.autocrlf=true`), and a SKILL.md authored/edited on
+    /// Windows via `skills add` would have CRLF too. The frontmatter parser
+    /// must accept both.
+    #[test]
+    fn load_skill_file_accepts_crlf_line_endings() {
+        let dir = std::env::temp_dir().join(format!("hc_skill_crlf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+
+        let crlf_content = "---\r\nname: crlf_test\r\ndescription: prueba CRLF\r\ncategory: recon\r\nversion: \"1.0\"\r\n---\r\n# Body\r\nContenido con CRLF.\r\n";
+        std::fs::write(&path, crlf_content).unwrap();
+
+        let loader = SkillLoader::new(&dir, &dir);
+        let skill = loader
+            .load_skill_file(&path, "test")
+            .expect("CRLF frontmatter must parse, not fail with 'no frontmatter'");
+        assert_eq!(skill.name, "crlf_test");
+        assert!(skill.body.contains("Contenido con CRLF"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_skill_file_still_accepts_lf_line_endings() {
+        let dir = std::env::temp_dir().join(format!("hc_skill_lf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+
+        let lf_content = "---\nname: lf_test\ndescription: prueba LF\ncategory: recon\nversion: \"1.0\"\n---\n# Body\nContenido con LF.\n";
+        std::fs::write(&path, lf_content).unwrap();
+
+        let loader = SkillLoader::new(&dir, &dir);
+        let skill = loader.load_skill_file(&path, "test").expect("LF frontmatter must keep parsing");
+        assert_eq!(skill.name, "lf_test");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
