@@ -4,11 +4,10 @@ use hivecyber_core::agent::catalog;
 use hivecyber_core::agent::stuck::StuckLoopDetector;
 use hivecyber_core::agent::acceptance::{run_acceptance_checks, verdict, CheckStatus};
 use hivecyber_core::security::{policies, audit};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 async fn temp_db() -> HiveDb {
-    let dir = PathBuf::from(format!("/tmp/hc_test_db_{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("hc_test_db_{}", uuid::Uuid::new_v4()));
     HiveDb::open(&dir).await.unwrap()
 }
 
@@ -654,10 +653,15 @@ async fn test_middleware_audits_tool_execution() {
         operator_id: "operator_1".into(),
     };
 
-    let args = serde_json::json!({"path": "/etc/hostname"});
+    // Read a file we create, not an OS-specific path like /etc/hostname (absent
+    // on macOS/Windows CI) — this test is about auditing, not the file's origin.
+    let read_path = std::env::temp_dir().join(format!("hc_audit_{}.txt", uuid::Uuid::new_v4()));
+    std::fs::write(&read_path, "hivecyber-audit-test").unwrap();
+    let args = serde_json::json!({ "path": read_path.to_string_lossy() });
     let result = mw.execute(tool, "fs_read", args, 30_000, &ctx).await;
+    let _ = std::fs::remove_file(&read_path);
 
-    assert!(result.success, "fs_read should succeed on /etc/hostname");
+    assert!(result.success, "fs_read should succeed on the temp file: {:?}", result.error);
 
     let entries = db.list(COL_AUDIT_LOG).await;
     assert_eq!(entries.len(), 1, "exactly one audit entry should exist");
@@ -728,12 +732,17 @@ fn test_extract_target_handles_structured_tools() {
 // SecurityContext::default() on every call, so every exploit tool always
 // rejected itself with "unsafe_mode disabled" regardless of what the
 // operator actually authorized. This test pins both behaviors down.
+// Linux-only: exercises the worker seccomp-sandbox round-trip. On macOS/Windows
+// the sandbox is unavailable and `Isolation::Sandbox` tools are refused fail-
+// closed (covered by the pure `sandbox_policy_tests` in the middleware module),
+// so there is nothing to round-trip there.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_middleware_sandbox_roundtrip_enforces_caller_security_context() {
     use hivecyber_core::tool_runtime::middleware::{AuditCtx, ToolMiddleware};
     use hivecyber_tools::{SecurityContext, Tool, ToolRegistry};
 
-    let worker_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/hivecyber-worker");
+    let worker_bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/hivecyber-worker");
     assert!(
         worker_bin.exists(),
         "hivecyber-worker binary not built at {:?} — run `cargo build -p hivecyber-worker` first",

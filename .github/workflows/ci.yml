@@ -34,6 +34,10 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
 
+      # The full suite runs on all three OSes. Tests that require unix-only
+      # facilities — `bash` (CliExec exec), `/etc` protected paths, the Linux
+      # seccomp worker — are gated with `#[cfg(unix)]` / `#[cfg(target_os =
+      # "linux")]`, so Windows runs the portable core/CLI logic and skips those.
       - name: Test
         run: cargo test --workspace
 

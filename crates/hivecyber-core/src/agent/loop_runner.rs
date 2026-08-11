@@ -584,7 +584,7 @@ mod rehydrate_tests {
     use crate::store::collections::COL_MESSAGES;
 
     async fn tmp_db() -> HiveDb {
-        let dir = std::path::PathBuf::from(format!("/tmp/hc_rehy_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("hc_rehy_{}", uuid::Uuid::new_v4()));
         HiveDb::open(&dir).await.unwrap()
     }
 

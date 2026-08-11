@@ -8,6 +8,9 @@ El núcleo (harness, delegación, sandbox seccomp, auditoría tamper-evident, BM
 implementado y testeado. **Antes de operar contra programas reales (Bugcrowd/HackerOne)**
 faltan controles de seguridad de engagement listados en el [Roadmap de seguridad](#roadmap-de-seguridad-pre-bug-bounty).
 
+📖 **[Manual de uso completo (docs/manual.md)](docs/manual.md)** — guía end-to-end: instalar →
+configurar → definir alcance → operar → auditar. Empieza aquí.
+
 | Componente | Tests | Estado |
 |---|---|---|
 | Workspace Cargo (7 crates) | — | `cargo build --release` OK |
@@ -175,6 +178,7 @@ Ver `.env.example` para todas las API keys soportadas.
 
 ## Documentacion
 
+- **[docs/manual.md](docs/manual.md) — 📖 Manual de uso end-to-end (empieza aquí)**
 - [docs/architecture.md](docs/architecture.md) — Arquitectura general + flujo del agent loop
 - [docs/agent-loop.md](docs/agent-loop.md) — Loop de larga duracion, durable runs, stuck-loop, compaction
 - [docs/tools.md](docs/tools.md) — Registro de tools, categorias, SecurityContext, worker sandbox

@@ -87,13 +87,23 @@ async fn test_fs_delete_removes_file_and_refuses_protected() {
     assert_eq!(result["deleted"], true);
     assert!(!file.exists());
 
-    // Refuses a protected path without touching the filesystem.
-    let refused = tool
-        .execute(serde_json::json!({ "path": "/etc", "recursive": true }))
-        .await
-        .unwrap();
-    assert_eq!(refused["error"], "refused");
-    assert!(std::path::Path::new("/etc").exists(), "/etc must still exist");
+    // Refuses a protected path without touching the filesystem. `/etc` is a
+    // unix system path; the assertion that it survives is unix-only.
+    #[cfg(unix)]
+    {
+        let refused = tool
+            .execute(serde_json::json!({ "path": "/etc", "recursive": true }))
+            .await
+            .unwrap();
+        assert_eq!(refused["error"], "refused");
+        assert!(std::path::Path::new("/etc").exists(), "/etc must still exist");
+    }
+}
+
+// Cross-platform temp file path (no hardcoded /tmp or /etc, which don't exist
+// on macOS/Windows CI).
+fn tmp_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("hc_{}_{}", std::process::id(), name))
 }
 
 #[tokio::test]
@@ -101,12 +111,13 @@ async fn test_fs_read_reads_file() {
     let reg = ToolRegistry::create_all();
     let tool = reg.get("fs_read").unwrap().clone();
 
+    let path = tmp_path("fsread.txt");
+    std::fs::write(&path, "línea uno\nlínea dos\n").unwrap();
     let result = tool
-        .execute(serde_json::json!({
-            "path": "/etc/hostname"
-        }))
+        .execute(serde_json::json!({ "path": path.to_string_lossy() }))
         .await
         .unwrap();
+    let _ = std::fs::remove_file(&path);
     assert!(result.get("content").is_some());
     assert!(result.get("total_lines").is_some());
 }
@@ -116,10 +127,13 @@ async fn test_fs_exists_checks_file() {
     let reg = ToolRegistry::create_all();
     let tool = reg.get("fs_exists").unwrap().clone();
 
+    let path = tmp_path("fsexists.txt");
+    std::fs::write(&path, "x").unwrap();
     let result = tool
-        .execute(serde_json::json!({"path": "/etc/hostname"}))
+        .execute(serde_json::json!({ "path": path.to_string_lossy() }))
         .await
         .unwrap();
+    let _ = std::fs::remove_file(&path);
     assert_eq!(result.get("exists").and_then(|v| v.as_bool()), Some(true));
 }
 
@@ -129,7 +143,7 @@ async fn test_fs_exists_nonexistent() {
     let tool = reg.get("fs_exists").unwrap().clone();
 
     let result = tool
-        .execute(serde_json::json!({"path": "/tmp/this_does_not_exist_xyz_123"}))
+        .execute(serde_json::json!({ "path": tmp_path("does_not_exist_xyz_123").to_string_lossy() }))
         .await
         .unwrap();
     assert_eq!(result.get("exists").and_then(|v| v.as_bool()), Some(false));
@@ -138,7 +152,9 @@ async fn test_fs_exists_nonexistent() {
 #[tokio::test]
 async fn test_fs_write_and_read_roundtrip() {
     let reg = ToolRegistry::create_all();
-    let path = "/tmp/hc_test_roundtrip.txt";
+    let path_buf = tmp_path("roundtrip.txt");
+    let path = path_buf.to_string_lossy().to_string();
+    let path = path.as_str();
 
     let write_tool = reg.get("fs_write").unwrap().clone();
     write_tool
@@ -165,7 +181,9 @@ async fn test_fs_write_and_read_roundtrip() {
 #[tokio::test]
 async fn test_fs_edit_replaces_text() {
     let reg = ToolRegistry::create_all();
-    let path = "/tmp/hc_test_edit.txt";
+    let path_buf = tmp_path("edit.txt");
+    let path = path_buf.to_string_lossy().to_string();
+    let path = path.as_str();
 
     let write = reg.get("fs_write").unwrap().clone();
     write
@@ -307,6 +325,8 @@ async fn test_cli_exec_hydra_unsafe_but_no_allowlist() {
     );
 }
 
+// Executes via `bash` (CliExec) — unix-only; Windows has no bash.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_cli_exec_hydra_allowed_with_unsafe_and_allowlist() {
     let sec = Arc::new(SecurityContext {
@@ -328,6 +348,8 @@ async fn test_cli_exec_hydra_allowed_with_unsafe_and_allowlist() {
     assert!(result.is_ok(), "safe echo should pass with unsafe+allowlist");
 }
 
+// Executes `echo` via `bash` (CliExec) — unix-only.
+#[cfg(unix)]
 #[tokio::test]
 async fn test_cli_exec_safe_command_works() {
     let sec = Arc::new(SecurityContext {
