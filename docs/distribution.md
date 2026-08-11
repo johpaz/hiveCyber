@@ -114,6 +114,23 @@ docker run --rm -it \
   hivecyber run "Escanea 10.0.0.0/24 y reporta servicios"
 ```
 
+### Imagen publicada en Docker Hub
+
+Cada release publica `johpaz/hivecyber` en Docker Hub, **multi-arch** (`linux/amd64` +
+`linux/arm64` — construida con `docker buildx` + QEMU, sin necesitar runners nativos
+por arquitectura; el Dockerfile no requiere cambios, cada plataforma compila nativamente
+dentro de su propio contexto de build):
+
+```bash
+docker pull johpaz/hivecyber:latest      # o :vX.Y.Z para una versión fija
+docker run --rm -it johpaz/hivecyber doctor
+```
+
+Publicado por el job `docker` de `release.yml` (`docker/build-push-action`), que requiere
+el secret de repo `DOCKERHUB_TOKEN` (access token de Docker Hub con permiso Read & Write;
+Docker Hub → Account Settings → Security → New Access Token). El usuario (`johpaz`) está
+fijo en el workflow, no es secreto.
+
 Herramientas **no** empaquetadas en Debian (instálalas en una imagen derivada si las
 necesitas): `nuclei`, `trivy`, `semgrep` (instaladores propios / go / pipx),
 `metasploit`, `crackmapexec`, `theHarvester`, `volatility3`, `zeek`, `osquery`.
