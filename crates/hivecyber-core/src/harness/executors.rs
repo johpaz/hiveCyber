@@ -218,10 +218,17 @@ impl JobExecutor for WorkerTaskExecutor {
                 }
 
                 // Cap tool results so a huge MCP response doesn't starve the
-                // worker's context window.
+                // worker's context window. Use `char_indices` so we never split
+                // a UTF-8 multibyte sequence (panics otherwise).
                 const MAX_TOOL_RESULT_CHARS: usize = 8000;
                 let result_str = if result_str.len() > MAX_TOOL_RESULT_CHARS {
-                    format!("{}…[truncado: {} chars totales]", &result_str[..MAX_TOOL_RESULT_CHARS], result_str.len())
+                    let cut = result_str
+                        .char_indices()
+                        .take_while(|(i, _)| *i <= MAX_TOOL_RESULT_CHARS)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(MAX_TOOL_RESULT_CHARS);
+                    format!("{}…[truncado: {} chars totales]", &result_str[..cut], result_str.len())
                 } else {
                     result_str
                 };

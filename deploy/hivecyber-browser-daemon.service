@@ -1,0 +1,28 @@
+[Unit]
+Description=hiveCyber browser backend (Bun.WebView daemon)
+After=network.target
+ Wants=network-online.target
+
+[Service]
+Type=simple
+User=jpaez
+Group=jpaez
+WorkingDirectory=/data/hiveCyber
+Environment=HIVECYBER_HOME=/data/hiveCyber/.hivecyber
+Environment=BUN_CHROME_PATH=/home/jpaez/.cache/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell
+Environment=AGENT_BROWSER_SOCK=/run/user/1000/hivecyber-browser.sock
+Environment=AGENT_BROWSER_IDLE_MS=900000
+Environment=AGENT_BROWSER_SCREENSHOT_DIR=/data/hiveCyber/findings/screenshots
+ExecStart=/home/jpaez/.bun/bin/bun run /data/hiveCyber/scripts/agent-browser-daemon.ts
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hivecyber-browser-daemon
+
+# Drop PrivateTmp — screenshots written to AGENT_BROWSER_SCREENSHOT_DIR must be
+# visible to other units / interactive shells.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

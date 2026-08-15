@@ -1,0 +1,31 @@
+[Unit]
+Description=hiveCyber durable queue dispatcher (daemon)
+After=network.target hivecyber-browser-daemon.service
+Requires=hivecyber-browser-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jpaez
+Group=jpaez
+WorkingDirectory=/data/hiveCyber
+Environment=HIVECYBER_HOME=/data/hiveCyber/.hivecyber
+Environment=AGENT_BROWSER_BIN=/home/jpaez/.local/bin/agent-browser
+Environment=BUN_CHROME_PATH=/home/jpaez/.cache/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell
+Environment=AGENT_BROWSER_SOCK=/run/user/1000/hivecyber-browser.sock
+Environment=AGENT_BROWSER_SCREENSHOT_DIR=/data/hiveCyber/findings/screenshots
+Environment=RUST_LOG=info,hivecyber_core=debug,hivecyber_providers=debug
+ExecStart=/usr/local/bin/hivecyber daemon \
+  --unsafe-mode \
+  --engagement-policy /data/hiveCyber/engagements/cfr-thinkglobalhealth/engagement-policy.json
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hivecyber-dispatcher
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

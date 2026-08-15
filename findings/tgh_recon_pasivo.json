@@ -1,0 +1,40 @@
+{
+  "status": "ok",
+  "what_was_done": "Reconocimiento pasivo/no intrusivo sobre https://thinkglobalhealth.org/ (Bugcrowd 'cfr'). GET a raíz, /robots.txt y /sitemap.xml. Sin crawling profundo, sin fuzzing, sin POST, sin logins. whois/dig/nmap no ejecutables en este entorno (cli_exec deshabilitado por política).",
+  "requests_made": [
+    {"method":"GET","url":"https://thinkglobalhealth.org/","http_code":200,"status":"ok","notable_headers":"No capturados (web_fetch solo expone el cuerpo; requiere curl -sI)"},
+    {"method":"GET","url":"https://thinkglobalhealth.org/robots.txt","http_code":200,"status":"ok","content_note":"Disallow: /search/ , /site-search/ , /_next/static/ . Sin declaración de sitemap."},
+    {"method":"GET","url":"https://thinkglobalhealth.org/sitemap.xml","http_code":404,"status":"not_found (página HTML de Next.js)"}
+  ],
+  "header_capture_gap": "web_fetch no expone response headers ni response time. Objetivos de 'present/missing' security headers en PENDING-VERIFICACION; NO declarar 'missing' sin evidencia. Requiere curl -sSI.",
+  "technologies": [
+    {"name":"Next.js (App Router) + Turbopack","confidence":"alto","evidence":"Chunks turbopack-*.js, rutas /_next/static/chunks/, payloads self.__next_f, meta next-size-adjust, RSC fragment markers. Build id 0e9a9c5."},
+    {"name":"CDN/estáticos en subdominio static.thinkglobalhealth.org","confidence":"alto","evidence":"Todos los assets JS/CSS desde https://static.thinkglobalhealth.org/0e9a9c5/_next/... (subdominio in-scope, no seguido en esta sesión pasiva)."},
+    {"name":"Cloudflare CDN","confidence":"bajo","evidence":"NO confirmada (sin headers accesibles). Requiere curl -sI (server/cf-ray)."},
+    {"name":"nginx","confidence":"bajo","evidence":"NO confirmada (sin Server header)."},
+    {"name":"PHP","confidence":"bajo","evidence":"NO evidenciada y probablemente refutable: stack visible es Node/Next.js."},
+    {"name":"New Relic","confidence":"bajo","evidence":"NO observada en HTML ni assets."},
+    {"name":"reCAPTCHA v3 (Google) + Datawrapper","confidence":"alto","evidence":"window.tgh_settings recaptchaSiteId 6Ldap7UrAAAA..., google.com/recaptcha/api.js, datawrapper.dwcdn.net."},
+    {"name":"Typekit (Adobe Fonts)","confidence":"medio","evidence":"use.typekit.net/ygq0fud.css y clases de fuente con hash."}
+  ],
+  "attack_surface": {
+    "paths": ["/search/","/site-search/","/_next/static/","/lemonde-journal-patch.css","/favicon.png","/favicon-32x32.png","/favicon-96x96.png","/apple-touch-icon.png"],
+    "endpoints": ["/search?full_text={search_term_string} (SearchAction urlTemplate)"],
+    "forms": ["Newsletter/Subscribe protegido con reCAPTCHA v3 (sin POST enviado)"],
+    "query_params": ["full_text (única entrada de usuario visible en primera capa)"],
+    "api_endpoints_visible": [],
+    "admin_paths_visible": []
+  },
+  "security_headers": {"present":[],"missing":[],"_note":"PENDING-VERIFICACION: requiere curl -sI / HEAD sobre apex y static.* para CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy."},
+  "hypotheses": [
+    {"id":"H1","statement":"Sitemap no existe en /sitemap.xml ni está en robots.txt; rutas solo descubribles por inferencia.","risk":"bajo"},
+    {"id":"H2","statement":"Security headers presentes o mal configurados, posible inconsistencia entre apex y static.thinkglobalhealth.org.","risk":"bajo"},
+    {"id":"H3","statement":"/search?full_text= puede reflejar/procesar la entrada de forma insegura (SOLO hipótesis; explorar en sesión posterior controlada).","risk":"bajo"}
+  ],
+  "notes": [
+    "JSON-LD usa www.thinkglobalhealth.org como @id/canonical; posible redirección apex->www (NO verificada).",
+    "Inconsistencia: recaptchaSiteId '6Ldap7UrAAAA...' en raíz vs 'undefined' en robots/sitemap (template SSR por ruta).",
+    "TLS y cookies no verificables con toolset actual (requiere curl/openssl).",
+    "Brecha de herramienta: whois/dig/nmap deshabilitados; DNS/WHOIS no ejecutados."
+  ]
+}
