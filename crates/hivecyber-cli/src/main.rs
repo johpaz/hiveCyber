@@ -449,7 +449,7 @@ async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Ar
             agent_id: agent_id.to_string(),
             user_message: input.to_string(),
             thread_id: thread_id.clone(),
-            max_iterations: std::cmp::min(max_iter, 10),
+            max_iterations: std::cmp::min(max_iter, 40),
             security: security.clone(),
             queue: Some(dispatch.queue()),
             mcp_manager: mcp.clone(),
@@ -519,11 +519,20 @@ async fn cmd_run(
     let active = install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue(), mcp.clone());
     dispatch.clone().start().await;
 
+    let agent = db
+        .get(hivecyber_core::store::collections::COL_AGENTS, agent_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("agent '{}' not found. Run `hivecyber agent list`", agent_id))?;
+    let max_iter = agent
+        .get("max_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as u32;
+
     let opts = hivecyber_core::agent::loop_runner::AgentLoopOptions {
         agent_id: agent_id.to_string(),
         user_message: prompt.to_string(),
         thread_id: thread_id.clone(),
-        max_iterations: 10,
+        max_iterations: std::cmp::min(max_iter, 40),
         security: security.clone(),
         queue: Some(dispatch.queue()),
         mcp_manager: mcp.clone(),

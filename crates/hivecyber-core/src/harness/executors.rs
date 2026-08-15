@@ -165,7 +165,7 @@ impl JobExecutor for WorkerTaskExecutor {
                 system: Some(system_prompt.to_string()),
                 messages: messages.clone(),
                 tools: active_tools.clone(),
-                max_tokens: Some(8192),
+                max_tokens: Some(16384),
             };
 
             let response = client.call(&req).await?;
@@ -216,6 +216,15 @@ impl JobExecutor for WorkerTaskExecutor {
                 if result.success {
                     evidence.push(format!("{}: {}", tool_call.name, result_str));
                 }
+
+                // Cap tool results so a huge MCP response doesn't starve the
+                // worker's context window.
+                const MAX_TOOL_RESULT_CHARS: usize = 8000;
+                let result_str = if result_str.len() > MAX_TOOL_RESULT_CHARS {
+                    format!("{}…[truncado: {} chars totales]", &result_str[..MAX_TOOL_RESULT_CHARS], result_str.len())
+                } else {
+                    result_str
+                };
 
                 messages.push(hivecyber_providers::Message {
                     role: "tool".into(),

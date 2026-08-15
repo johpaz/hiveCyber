@@ -23,7 +23,7 @@ Thumbs.db
 !.env.example
 
 # hiveCyber runtime data
-~/.hivecyber/
+.hivecyber/
 *.pid
 *.log
 

@@ -6,6 +6,9 @@
 //!   worker table becomes a live, ranked routing aid.
 //! - `build_skill_context`: ranks the available skills (from `COL_SKILLS`)
 //!   against the task and surfaces the most relevant playbooks in the prompt.
+//! - `build_mcp_tools_context`: lists the connected MCP servers' tools so the
+//!   coordinator knows what capabilities are available beyond the built-in set —
+//!   critical for 27B-class models that may not reliably inspect the tool schema.
 
 use crate::agent::catalog_selector::{
     render_agent_routing_catalog, search_catalog_agents, RoutableAgent,
@@ -15,6 +18,7 @@ use crate::store::HiveDb;
 use crate::store::collections::{COL_AGENTS, COL_SKILLS};
 
 const MAX_RANKED_WORKERS: usize = 5;
+const MAX_MCP_TOOLS_LISTED: usize = 25;
 
 /// Build the coordinator's live routing block, or empty string if there are no
 /// worker agents to route to.
@@ -109,4 +113,47 @@ async fn load_skills(db: &HiveDb) -> Vec<SkillDescriptor> {
             SkillDescriptor { name, description, category, tags }
         })
         .collect()
+}
+
+/// Build a context block listing the connected MCP servers and their tools, so
+/// the coordinator can see (in its system prompt) what MCP capabilities are
+/// available — not just what the BM25 selector happened to surface this turn.
+pub async fn build_mcp_tools_context(mcp: &crate::agent::mcp_integration::SharedMcp) -> String {
+    let tools: Vec<(String, String, String)> = {
+        let mgr = mcp.lock().await;
+        mgr.list_tools()
+            .into_iter()
+            .map(|t| (t.server_name.clone(), t.name.clone(), t.description.clone()))
+            .collect()
+    };
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut servers: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (server, name, desc) in &tools {
+        servers
+            .entry(server.clone())
+            .or_default()
+            .push((name.clone(), desc.clone()));
+    }
+    let mut s = String::from("## Herramientas MCP disponibles (conectadas y listas)\n");
+    s.push_str("Estas tools están registradas y disponibles para tu uso. Menciónalas por nombre exacto.\n\n");
+    let mut total = 0;
+    for (server, tool_list) in &servers {
+        s.push_str(&format!("**{}** ({} tools):\n", server, tool_list.len()));
+        for (name, desc) in tool_list {
+            if total >= MAX_MCP_TOOLS_LISTED {
+                s.push_str(&format!("  … y {} más\n", tools.len() - total));
+                break;
+            }
+            let short_desc = desc.chars().take(100).collect::<String>();
+            s.push_str(&format!("  - `{}` — {}\n", name, short_desc));
+            total += 1;
+        }
+        if total >= MAX_MCP_TOOLS_LISTED {
+            break;
+        }
+    }
+    s
 }
