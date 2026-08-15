@@ -285,6 +285,7 @@ impl ToolRegistry {
             std::sync::Arc::new(base::FsList),
             std::sync::Arc::new(base::FsDelete),
             std::sync::Arc::new(base::WebFetch),
+            std::sync::Arc::new(base::WebHead),
             std::sync::Arc::new(base::WebSearch),
             std::sync::Arc::new(base::CliExec::new(sec.clone())),
         ];
