@@ -86,6 +86,7 @@ impl Tool for FsWrite {
     fn name(&self) -> &str { "fs_write" }
     fn description(&self) -> &str { "Escribe contenido a un archivo (sobreescribe)." }
     fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn isolation(&self) -> Isolation { Isolation::Sandbox }
     fn parameters(&self) -> ToolSchema {
         let mut props = HashMap::new();
         props.insert("path".into(), json!({"type": "string"}));
@@ -118,6 +119,7 @@ impl Tool for FsEdit {
     fn name(&self) -> &str { "fs_edit" }
     fn description(&self) -> &str { "Reemplaza texto exacto en un archivo." }
     fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn isolation(&self) -> Isolation { Isolation::Sandbox }
     fn parameters(&self) -> ToolSchema {
         let mut props = HashMap::new();
         props.insert("path".into(), json!({"type": "string"}));
@@ -329,6 +331,7 @@ impl Tool for FsDelete {
     fn name(&self) -> &str { "fs_delete" }
     fn description(&self) -> &str { "Elimina un archivo o directorio. Con recursive=true borra directorios no vacíos." }
     fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn isolation(&self) -> Isolation { Isolation::Sandbox }
     fn parameters(&self) -> ToolSchema {
         let mut props = HashMap::new();
         props.insert("path".into(), json!({"type": "string"}));
@@ -601,6 +604,7 @@ impl Tool for CliExec {
     fn name(&self) -> &str { "cli_exec" }
     fn description(&self) -> &str { "Ejecuta un comando CLI y retorna stdout/stderr." }
     fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn isolation(&self) -> Isolation { Isolation::Sandbox }
     fn parameters(&self) -> ToolSchema {
         let mut props = HashMap::new();
         props.insert("command".into(), json!({"type": "string", "description": "Comando a ejecutar"}));
@@ -616,7 +620,19 @@ impl Tool for CliExec {
     async fn execute(&self, params: Value) -> Result<Value> {
         let p = read_params(&params)?;
         let command = p.get("command").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("command required"))?;
-        let cwd = get_str(&p, "cwd", ".");
+        // No explicit `cwd` from the caller -> default to this task/session's
+        // scratch dir (if one was assigned) instead of the process's own cwd,
+        // which inside a sandboxed-worker invocation would otherwise resolve
+        // to the fresh worker process's unrelated `$HOME`.
+        let cwd = match p.get("cwd").and_then(|v| v.as_str()) {
+            Some(explicit) => explicit.to_string(),
+            None => self
+                .security
+                .task_root
+                .as_ref()
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|| ".".to_string()),
+        };
         let timeout_secs = get_u64(&p, "timeout_seconds", 30);
 
         // cli_exec is disabled by default. It must be explicitly enabled via

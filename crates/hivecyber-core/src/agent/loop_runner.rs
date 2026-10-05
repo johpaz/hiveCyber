@@ -180,7 +180,21 @@ async fn run_loop(
         .unwrap_or("")
         .to_string();
 
-    let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(opts.security.clone());
+    // Per-session scratch dir: same rationale as the worker_task executor
+    // (harness/executors.rs) — gives cli_exec/fs_write/fs_edit/fs_delete a
+    // default working directory scoped to this interactive session instead of
+    // the process's own cwd. Keyed by thread_id since the interactive loop has
+    // no task_id of its own.
+    let scratch_dir = std::path::PathBuf::from(&config.home_dir)
+        .join("scratch")
+        .join(&opts.thread_id);
+    tokio::fs::create_dir_all(&scratch_dir).await?;
+    let session_security = Arc::new(hivecyber_tools::SecurityContext {
+        task_root: Some(scratch_dir),
+        ..(*opts.security).clone()
+    });
+
+    let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(session_security.clone());
 
     let role = agent
         .get("role")
@@ -354,12 +368,12 @@ async fn run_loop(
     // the conversation's thread_id is used as the run identifier.
     let middleware = crate::tool_runtime::middleware::ToolMiddleware::new(
         db.clone(),
-        opts.security.clone(),
+        session_security.clone(),
     );
     let audit_ctx = crate::tool_runtime::middleware::AuditCtx {
         worker: opts.agent_id.clone(),
         run_id: opts.thread_id.clone(),
-        operator_id: opts.security.operator_id.clone(),
+        operator_id: session_security.operator_id.clone(),
     };
 
     for iteration in 0..max_iter {

@@ -17,6 +17,19 @@ WORKDIR /build
 COPY . .
 RUN cargo build --release --bin hivecyber --bin hivecyber-worker
 
+# ---- obscura-builder (disabled until pinned — see below) ----
+# Obscura (browser-automation MCP server, replaces the old agent-browser/
+# Bun.WebView daemon). Commented out on purpose: it must be pinned to an
+# exact, already-vetted commit/tag/checksum before this image ships browser
+# automation — never a moving branch. To enable: uncomment this stage AND
+# the matching `COPY --from=obscura-builder` line in the runtime stage below.
+#
+# FROM rust:1-bookworm AS obscura-builder
+# WORKDIR /obscura
+# RUN git clone --depth 1 --branch <VETTED_TAG_OR_COMMIT> <VETTED_REPO_URL> . \
+#     && echo "<EXPECTED_SHA256>  Cargo.lock" | sha256sum -c - \
+#     && cargo build --release --bin obscura-mcp
+
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
 
@@ -38,7 +51,12 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/hivecyber /usr/local/bin/hivecyber
 COPY --from=builder /build/target/release/hivecyber-worker /usr/local/bin/hivecyber-worker
+# Uncomment once the obscura-builder stage above is enabled:
+# COPY --from=obscura-builder /obscura/target/release/obscura-mcp /usr/local/bin/obscura-mcp
 # Opt-in egress-firewalled entrypoint (run as root + --cap-add=NET_ADMIN). Ver docs/egress.md.
+# Also registers the Obscura MCP server (if /usr/local/bin/obscura-mcp is
+# present) before dropping to the unprivileged `hive` user — see the [mcp]
+# step added to this script.
 COPY docker/egress-entrypoint.sh /usr/local/bin/egress-entrypoint.sh
 RUN chmod +x /usr/local/bin/egress-entrypoint.sh
 

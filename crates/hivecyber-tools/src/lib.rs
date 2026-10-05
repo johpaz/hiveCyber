@@ -3,7 +3,6 @@ pub mod recon;
 pub mod vulns;
 pub mod exploit;
 pub mod forensics;
-pub mod web;
 pub mod office;
 pub mod delegation;
 pub mod memory;

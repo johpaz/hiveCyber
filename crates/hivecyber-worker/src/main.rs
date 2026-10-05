@@ -23,6 +23,8 @@ struct WorkerSecurityCtx {
     allow_cli_exec: bool,
     #[serde(default)]
     engagement_policy: Option<hivecyber_tools::EngagementPolicy>,
+    #[serde(default)]
+    task_root: Option<String>,
 }
 
 impl WorkerSecurityCtx {
@@ -34,6 +36,7 @@ impl WorkerSecurityCtx {
             engagement_policy: self.engagement_policy.map(Arc::new),
             human_approvals: Arc::new(Mutex::new(HashSet::new())),
             allow_cli_exec: self.allow_cli_exec,
+            task_root: self.task_root.map(std::path::PathBuf::from),
         }
     }
 }

@@ -200,6 +200,7 @@ async fn dispatch_to_worker(
             "operator_id": security.operator_id,
             "allow_cli_exec": security.allow_cli_exec,
             "engagement_policy": security.engagement_policy.as_ref().map(|p| p.as_ref()),
+            "task_root": security.task_root.as_ref().map(|p| p.display().to_string()),
         },
     });
 

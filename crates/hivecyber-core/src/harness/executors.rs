@@ -77,6 +77,20 @@ impl JobExecutor for WorkerTaskExecutor {
 
         info!("worker_task executor: job={} task={} worker={}", job_id, task_id, worker_id);
 
+        // Per-task scratch dir: gives cli_exec/fs_write/fs_edit/fs_delete a
+        // default working directory scoped to this task instead of the
+        // process's own cwd (or, for sandboxed-worker calls, the fresh
+        // worker process's unrelated $HOME). Reaped by DispatchLoop's
+        // maintenance tick once the task reaches a terminal status.
+        let scratch_dir = std::path::PathBuf::from(&self.config.home_dir)
+            .join("scratch")
+            .join(task_id);
+        tokio::fs::create_dir_all(&scratch_dir).await?;
+        let task_security = Arc::new(hivecyber_tools::SecurityContext {
+            task_root: Some(scratch_dir),
+            ..(*self.security).clone()
+        });
+
         let task_val = self.db.get(COL_TASKS, task_id).await
             .ok_or_else(|| anyhow::anyhow!("task not found: {}", task_id))?;
 
@@ -115,7 +129,7 @@ impl JobExecutor for WorkerTaskExecutor {
             .and_then(|t| serde_json::from_value(t.clone()).ok())
             .unwrap_or_default();
 
-        let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(self.security.clone());
+        let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(task_security.clone());
         // MCP tools are exposed to workers too; the allowlist below still gates
         // which ones this specific worker may call.
         if let Some(mcp) = self.mcp.as_ref() {
@@ -191,11 +205,11 @@ impl JobExecutor for WorkerTaskExecutor {
                 .map(|tc| (tc.name.clone(), tc.arguments.clone()))
                 .collect();
 
-            let middleware = ToolMiddleware::new(self.db.clone(), self.security.clone());
+            let middleware = ToolMiddleware::new(self.db.clone(), task_security.clone());
             let audit_ctx = AuditCtx {
                 worker: worker_id.to_string(),
                 run_id: job_id.to_string(),
-                operator_id: self.security.operator_id.clone(),
+                operator_id: task_security.operator_id.clone(),
             };
             let results = execute_tool_batch_audited(
                 tool_calls_vec,

@@ -5,8 +5,14 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::store::HiveDb;
+use crate::store::collections::COL_TASKS;
 use crate::config::Config;
 use crate::harness::{DurableQueue, executors::{WorkerTaskExecutor, JobExecutor, ExecutorResult}};
+
+/// Task statuses reaping treats as terminal — no further tool execution will
+/// touch that task's scratch dir. `acceptance_pending`/`acceptance_unchecked`
+/// are deliberately excluded: those tasks may still be re-run or re-checked.
+const TERMINAL_TASK_STATUSES: &[&str] = &["completed", "blocked", "failed"];
 
 pub struct DispatchLoop {
     db: HiveDb,
@@ -122,7 +128,61 @@ impl DispatchLoop {
         if !expired.is_empty() {
             info!("maintenance: {} expired leases reclaimed", expired.len());
         }
+        self.reap_scratch_dirs().await;
         Ok(())
+    }
+
+    /// Delete `$HIVECYBER_HOME/scratch/<task_id>/` for tasks that reached a
+    /// terminal status more than `tools.scratch_retention_hours` ago.
+    ///
+    /// Scoped strictly to the `scratch/` subtree: this must never be widened
+    /// to a blanket `$HIVECYBER_HOME` cleanup, since `findings/`/`reports/`
+    /// (engagement deliverables) live as siblings of `scratch/` and are never
+    /// meant to be reaped by this or any other maintenance pass.
+    async fn reap_scratch_dirs(&self) {
+        let scratch_root = std::path::PathBuf::from(&self.config.home_dir).join("scratch");
+        if !scratch_root.is_dir() {
+            return;
+        }
+
+        let retention = std::time::Duration::from_secs(
+            self.config.tools.scratch_retention_hours.saturating_mul(3600),
+        );
+        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(retention).unwrap_or_default();
+
+        for (task_id, doc) in self.db.list(COL_TASKS).await {
+            let status = doc.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if !TERMINAL_TASK_STATUSES.contains(&status) {
+                continue;
+            }
+            let updated_at = doc
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+            let is_stale = match updated_at {
+                Some(ts) => ts < cutoff,
+                // No (or unparseable) updated_at on a terminal task — don't
+                // guess; leave it for a future pass once it has one.
+                None => false,
+            };
+            if !is_stale {
+                continue;
+            }
+
+            // Defense in depth: task_id is an internally generated uuid, but
+            // never resolve/remove anything outside `scratch_root` regardless.
+            let dir = scratch_root.join(&task_id);
+            if dir.parent() != Some(scratch_root.as_path()) {
+                warn!("maintenance: refusing to reap suspicious scratch path for task {}", task_id);
+                continue;
+            }
+            if dir.is_dir() {
+                match tokio::fs::remove_dir_all(&dir).await {
+                    Ok(()) => info!("maintenance: reaped scratch dir for terminal task {}", task_id),
+                    Err(e) => warn!("maintenance: failed to reap scratch dir for task {}: {}", task_id, e),
+                }
+            }
+        }
     }
 
     pub async fn start(self: Arc<Self>) {

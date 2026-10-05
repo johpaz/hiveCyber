@@ -39,5 +39,20 @@ else
   echo "[egress] AVISO: HIVECYBER_EGRESS_POLICY no definido — el contenedor corre SIN firewall de egreso (inseguro para bug bounty)." >&2
 fi
 
+# Register the Obscura MCP server (browser automation) as the `hive` user,
+# idempotently, before the real process boots — `agent/mcp_integration.rs`'s
+# `load_and_connect` connects every registered MCP server eagerly at `chat`/
+# `run`/`daemon` startup, so this just needs to exist in HiveDB beforehand.
+# Safe to run every container start: `hivecyber mcp add` overwrites the same
+# key, and the `mcp list` check below skips it if already present.
+if [ -x /usr/local/bin/obscura-mcp ]; then
+  if ! runuser -u hive -- hivecyber mcp list 2>/dev/null | grep -q '^  obscura '; then
+    echo "[mcp] registrando servidor obscura (stdio, /usr/local/bin/obscura-mcp)" >&2
+    runuser -u hive -- hivecyber mcp add obscura --transport stdio --command /usr/local/bin/obscura-mcp
+  fi
+else
+  echo "[mcp] AVISO: /usr/local/bin/obscura-mcp no presente en esta imagen — sin tool de browser." >&2
+fi
+
 # Drop to the unprivileged app user for the actual work.
 exec runuser -u hive -- hivecyber "$@"

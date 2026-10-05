@@ -230,6 +230,7 @@ async fn test_cli_exec_dangerous_blocked() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: true,
+        task_root: None,
     });
     let reg = ToolRegistry::create_with_security(sec);
     let cli = reg.get("cli_exec").unwrap().clone();
@@ -265,6 +266,7 @@ async fn test_cli_exec_disabled_by_default() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     });
     let reg = ToolRegistry::create_with_security(sec);
     let cli = reg.get("cli_exec").unwrap().clone();
@@ -289,6 +291,7 @@ async fn test_cli_exec_hydra_blocked_without_unsafe() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: true,
+        task_root: None,
     });
     let reg = ToolRegistry::create_with_security(sec);
     let cli = reg.get("cli_exec").unwrap().clone();
@@ -310,6 +313,7 @@ async fn test_cli_exec_hydra_unsafe_but_no_allowlist() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: true,
+        task_root: None,
     });
     let reg = ToolRegistry::create_with_security(sec);
     let cli = reg.get("cli_exec").unwrap().clone();
@@ -336,6 +340,7 @@ async fn test_cli_exec_hydra_allowed_with_unsafe_and_allowlist() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: true,
+        task_root: None,
     });
     let reg = ToolRegistry::create_with_security(sec);
     let cli = reg.get("cli_exec").unwrap().clone();
@@ -359,6 +364,7 @@ async fn test_cli_exec_safe_command_works() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: true,
+        task_root: None,
     });
     let reg = ToolRegistry::create_with_security(sec);
     let cli = reg.get("cli_exec").unwrap().clone();
@@ -388,6 +394,7 @@ async fn test_cli_exec_rejects_out_of_scope_target() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: true,
+        task_root: None,
     });
     let reg = ToolRegistry::create_with_security(sec);
     let cli = reg.get("cli_exec").unwrap().clone();
@@ -445,6 +452,7 @@ fn test_security_context_validate_target_blocks_without_allowlist() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
     let result = sec.validate_target("10.0.0.5");
     assert!(result.is_err(), "should fail with empty allowlist");
@@ -459,6 +467,7 @@ fn test_security_context_validate_target_allows_in_cidr() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
     assert!(sec.validate_target("10.0.0.5").is_ok());
     assert!(sec.validate_target("10.0.0.255").is_ok());
@@ -488,6 +497,7 @@ fn test_validate_target_enforces_rate_limit() {
         engagement_policy: Some(Arc::new(policy)),
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
 
     assert!(sec.validate_target("example.com").is_ok(), "first request allowed");
@@ -505,6 +515,7 @@ fn test_security_context_validate_target_blocks_outside_cidr() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
     assert!(sec.validate_target("10.0.1.5").is_err());
     assert!(sec.validate_target("192.168.1.1").is_err());
@@ -519,6 +530,7 @@ fn test_security_context_validate_target_allows_exact() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
     assert!(sec.validate_target("example.com").is_ok());
     assert!(sec.validate_target("evil.com").is_err());
@@ -537,6 +549,7 @@ fn test_security_context_validate_ipv6_cidr() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
     assert!(sec.validate_target("fe80::1").is_ok(), "fe80::1 should be in fe80::/10");
     assert!(sec.validate_target("2001:db8::1").is_err());
@@ -551,6 +564,7 @@ fn test_security_context_validate_normalizes_port_and_dot() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
     assert!(sec.validate_target("example.com.").is_ok(), "trailing dot");
     assert!(sec.validate_target("EXAMPLE.com").is_ok(), "uppercase");
@@ -566,6 +580,7 @@ fn test_security_context_validate_decimal_ipv4() {
         engagement_policy: None,
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: false,
+        task_root: None,
     };
     assert!(
         sec.validate_target("2130706433").is_ok(),

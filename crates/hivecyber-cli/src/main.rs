@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod container_launch;
+
 #[derive(Parser)]
 #[command(name = "hivecyber")]
 #[command(version, about = "Harness de ciberseguridad con agentes de larga duracion")]
@@ -31,6 +33,13 @@ struct Cli {
 
     #[arg(long, global = true, value_name = "CATEGORY")]
     approve_human: Vec<String>,
+
+    /// Re-exec this exact invocation inside a Podman container
+    /// (`hivecyber:sandboxed`), with the nftables egress firewall derived
+    /// from `--engagement-policy` applied before the real process starts.
+    /// Same effect as `HIVECYBER_CONTAINERIZE=1`.
+    #[arg(long, global = true)]
+    containerize: bool,
 }
 
 #[derive(Subcommand)]
@@ -207,6 +216,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Re-exec inside Podman before touching HiveDb/Config at all: the
+    // containerized process does all of that itself, inside its own mount
+    // namespace. Doing this check first also means a bad `--engagement-policy`
+    // path still gets caught by the container's own `--require-policy` gate
+    // below, not silently skipped here.
+    if container_launch::requested(cli.containerize) {
+        let code = container_launch::exec_in_podman(cli.engagement_policy.as_deref()).await?;
+        std::process::exit(code);
+    }
+
     let mut config = Config::default();
     let db_path = PathBuf::from(&config.home_dir).join("db");
 
@@ -330,6 +349,7 @@ fn build_security_context(cli: &Cli) -> Arc<hivecyber_tools::SecurityContext> {
         engagement_policy: policy.map(Arc::new),
         human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         allow_cli_exec: cli.allow_cli_exec,
+        task_root: None,
     });
 
     for category in &cli.approve_human {

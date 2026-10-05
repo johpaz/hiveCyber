@@ -39,6 +39,16 @@ fn default_context_budget() -> usize {
 pub struct ToolsConfig {
     pub worker_pool: WorkerPoolConfig,
     pub exec: ExecConfig,
+    /// How long a task's `$HIVECYBER_HOME/scratch/<task_id>/` dir survives
+    /// after the task reaches a terminal status, before `DispatchLoop`'s
+    /// maintenance tick reaps it. Does not apply to `findings/`/`reports/`
+    /// (engagement-scoped, persistent, never reaped by this mechanism).
+    #[serde(default = "default_scratch_retention_hours")]
+    pub scratch_retention_hours: u64,
+}
+
+fn default_scratch_retention_hours() -> u64 {
+    24
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +126,10 @@ impl Default for Config {
                     enabled: true,
                     timeout_seconds: 30,
                 },
+                scratch_retention_hours: std::env::var("HIVECYBER_SCRATCH_RETENTION_HOURS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(default_scratch_retention_hours),
             },
             skills: SkillsConfig {
                 allow_bundled: true,

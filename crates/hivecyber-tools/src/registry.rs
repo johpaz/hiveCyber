@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use crate::base;
 use crate::recon;
-use crate::web;
 use crate::engagement::EngagementPolicy;
 
 #[derive(Debug, Clone, Default)]
@@ -16,6 +15,12 @@ pub struct SecurityContext {
     pub engagement_policy: Option<Arc<EngagementPolicy>>,
     pub human_approvals: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub allow_cli_exec: bool,
+    /// Per-task/per-session scratch directory (`$HIVECYBER_HOME/scratch/<task_id>/`
+    /// or `.../scratch/<thread_id>/`). Tools that need a default working
+    /// directory (e.g. `cli_exec`'s `cwd`) fall back to this instead of the
+    /// process's own cwd, so sandboxed-worker calls land in the calling
+    /// task's scratch space rather than the fresh worker process's `$HOME`.
+    pub task_root: Option<std::path::PathBuf>,
 }
 
 /// Process-global per-(program, host) last-request timestamps for rate limiting,
@@ -313,9 +318,13 @@ impl ToolRegistry {
         for tool in crate::forensics::create_all() {
             reg.register(tool);
         }
-        for tool in crate::web::create_all() {
-            reg.register(tool);
-        }
+        // Browser automation is provided by the Obscura MCP server (registered
+        // via `hivecyber mcp add obscura ...`, see docker/egress-entrypoint.sh),
+        // not a native tool — it needs to run inside this process's own
+        // container boundary, not shell out to a host-level daemon. See
+        // agent/mcp_integration.rs's native-tools-win collision rule: as long
+        // as no native tool is registered under these names, Obscura's
+        // `browser_navigate`/`browser_click`/etc. proxy in cleanly.
         for tool in crate::office::create_all() {
             reg.register(tool);
         }
