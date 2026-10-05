@@ -12,7 +12,10 @@ async fn test_registry_create_all_has_base_tools() {
         "nuclei", "nikto", "sqlmap", "searchsploit", "semgrep", "trivy",
         "metasploit_rpc", "hydra", "crackmapexec", "mimikatz",
         "volatility", "yara_scan", "zeek_parse", "osquery", "log_parse",
-        "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "browser_extract",
+        // browser_* tools are no longer native: browser automation is provided
+        // by the Obscura MCP server (registered via `hivecyber mcp add obscura`),
+        // which runs inside the per-session/per-task container boundary instead
+        // of shelling out to an unsandboxed host-level daemon.
         "office_read", "office_write",
     ] {
         assert!(
@@ -27,7 +30,9 @@ async fn test_registry_create_all_has_base_tools() {
 async fn test_registry_with_security_includes_all() {
     let sec = Arc::new(SecurityContext::default());
     let reg = ToolRegistry::create_with_security(sec);
-    assert!(reg.names().len() >= 37, "expected 37+ tools with security");
+    // Was >= 37 before the native browser_* tools (5) were retired in favor of
+    // the Obscura MCP server — lowered to match, not loosened arbitrarily.
+    assert!(reg.names().len() >= 32, "expected 32+ tools with security");
 }
 
 #[tokio::test]
