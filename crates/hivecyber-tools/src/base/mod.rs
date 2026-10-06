@@ -34,7 +34,35 @@ fn get_u64(params: &HashMap<String, Value>, key: &str, default: u64) -> u64 {
     params.get(key).and_then(|v| v.as_u64()).unwrap_or(default)
 }
 
-pub struct FsRead;
+/// Resolve a path param against this task/session's scratch dir
+/// (`SecurityContext.task_root`), same rationale as `cli_exec`'s `cwd`
+/// default: a relative path (`"report.txt"`, `"."`) lands in the calling
+/// task's scratch space instead of the process's own cwd (or, for a
+/// sandboxed-worker call, the fresh worker process's unrelated `$HOME`).
+/// Absolute paths pass through unchanged — this resolves the *default*
+/// working directory, it is not a jail (an agent that asks for `/etc/passwd`
+/// still gets `/etc/passwd`; containing that is the separate, not-yet-built
+/// hardening pass noted in the sandbox-architecture plan).
+fn resolve_path(security: &crate::registry::SecurityContext, raw: &str) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        return p;
+    }
+    match &security.task_root {
+        Some(root) => root.join(p),
+        None => p,
+    }
+}
+
+pub struct FsRead {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl FsRead {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        FsRead { security }
+    }
+}
 
 #[async_trait]
 impl Tool for FsRead {
@@ -55,12 +83,13 @@ impl Tool for FsRead {
     async fn execute(&self, params: Value) -> Result<Value> {
         let p = read_params(&params)?;
         let path = p.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("path required"))?;
+        let resolved = resolve_path(&self.security, path);
         let offset = get_u64(&p, "offset", 0) as usize;
         let limit = get_u64(&p, "limit", 2000) as usize;
 
-        let content = tokio::fs::read_to_string(path)
+        let content = tokio::fs::read_to_string(&resolved)
             .await
-            .with_context(|| format!("read {}", path))?;
+            .with_context(|| format!("read {}", resolved.display()))?;
 
         let lines: Vec<&str> = content.lines().collect();
         let end = std::cmp::min(offset + limit, lines.len());
@@ -71,7 +100,7 @@ impl Tool for FsRead {
         };
 
         Ok(json!({
-            "path": path,
+            "path": resolved.display().to_string(),
             "content": slice,
             "total_lines": lines.len(),
             "showed_lines": end - offset,
@@ -79,7 +108,15 @@ impl Tool for FsRead {
     }
 }
 
-pub struct FsWrite;
+pub struct FsWrite {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl FsWrite {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        FsWrite { security }
+    }
+}
 
 #[async_trait]
 impl Tool for FsWrite {
@@ -101,18 +138,27 @@ impl Tool for FsWrite {
         let p = read_params(&params)?;
         let path = p.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("path required"))?;
         let content = p.get("content").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("content required"))?;
+        let resolved = resolve_path(&self.security, path);
 
-        if let Some(parent) = PathBuf::from(path).parent() {
+        if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::write(path, content).await?;
+        tokio::fs::write(&resolved, content).await?;
 
-        Ok(json!({"path": path, "written": content.len()}))
+        Ok(json!({"path": resolved.display().to_string(), "written": content.len()}))
     }
 }
 
-pub struct FsEdit;
+pub struct FsEdit {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl FsEdit {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        FsEdit { security }
+    }
+}
 
 #[async_trait]
 impl Tool for FsEdit {
@@ -136,21 +182,30 @@ impl Tool for FsEdit {
         let path = p.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("path required"))?;
         let old = p.get("old").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("old required"))?;
         let new = p.get("new").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("new required"))?;
+        let resolved = resolve_path(&self.security, path);
 
-        let content = tokio::fs::read_to_string(path).await?;
+        let content = tokio::fs::read_to_string(&resolved).await?;
         let new_content = content.replacen(old, new, 1);
 
         if new_content == content {
             return Err(anyhow!("old string not found in file"));
         }
 
-        tokio::fs::write(path, &new_content).await?;
+        tokio::fs::write(&resolved, &new_content).await?;
 
-        Ok(json!({"path": path, "replaced": 1}))
+        Ok(json!({"path": resolved.display().to_string(), "replaced": 1}))
     }
 }
 
-pub struct FsGlob;
+pub struct FsGlob {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl FsGlob {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        FsGlob { security }
+    }
+}
 
 #[async_trait]
 impl Tool for FsGlob {
@@ -170,7 +225,7 @@ impl Tool for FsGlob {
     async fn execute(&self, params: Value) -> Result<Value> {
         let p = read_params(&params)?;
         let pattern = p.get("pattern").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("pattern required"))?;
-        let base = get_str(&p, "path", ".");
+        let base = resolve_path(&self.security, &get_str(&p, "path", "."));
 
         let mut results = Vec::new();
         for entry in walkdir::WalkDir::new(&base).into_iter().filter_map(|e| e.ok()) {
@@ -254,7 +309,15 @@ fn glob_single_match(pattern: &str, name: &str) -> bool {
     pi == pb.len()
 }
 
-pub struct FsExists;
+pub struct FsExists {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl FsExists {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        FsExists { security }
+    }
+}
 
 #[async_trait]
 impl Tool for FsExists {
@@ -273,15 +336,24 @@ impl Tool for FsExists {
     async fn execute(&self, params: Value) -> Result<Value> {
         let p = read_params(&params)?;
         let path = p.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("path required"))?;
+        let resolved = resolve_path(&self.security, path);
 
-        let exists = tokio::fs::metadata(path).await.is_ok();
-        let is_dir = tokio::fs::metadata(path).await.map(|m| m.is_dir()).unwrap_or(false);
+        let exists = tokio::fs::metadata(&resolved).await.is_ok();
+        let is_dir = tokio::fs::metadata(&resolved).await.map(|m| m.is_dir()).unwrap_or(false);
 
-        Ok(json!({"path": path, "exists": exists, "is_dir": is_dir}))
+        Ok(json!({"path": resolved.display().to_string(), "exists": exists, "is_dir": is_dir}))
     }
 }
 
-pub struct FsList;
+pub struct FsList {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl FsList {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        FsList { security }
+    }
+}
 
 #[async_trait]
 impl Tool for FsList {
@@ -299,11 +371,11 @@ impl Tool for FsList {
     }
     async fn execute(&self, params: Value) -> Result<Value> {
         let p = read_params(&params)?;
-        let path = get_str(&p, "path", ".");
+        let resolved = resolve_path(&self.security, &get_str(&p, "path", "."));
 
-        let mut rd = tokio::fs::read_dir(&path)
+        let mut rd = tokio::fs::read_dir(&resolved)
             .await
-            .with_context(|| format!("read_dir {}", path))?;
+            .with_context(|| format!("read_dir {}", resolved.display()))?;
         let mut entries = Vec::new();
         while let Some(entry) = rd.next_entry().await? {
             let meta = entry.metadata().await.ok();
@@ -320,11 +392,19 @@ impl Tool for FsList {
                 .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
         });
 
-        Ok(json!({"path": path, "count": entries.len(), "entries": entries}))
+        Ok(json!({"path": resolved.display().to_string(), "count": entries.len(), "entries": entries}))
     }
 }
 
-pub struct FsDelete;
+pub struct FsDelete {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl FsDelete {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        FsDelete { security }
+    }
+}
 
 #[async_trait]
 impl Tool for FsDelete {
@@ -346,36 +426,40 @@ impl Tool for FsDelete {
         let p = read_params(&params)?;
         let path = p.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("path required"))?;
         let recursive = p.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Guard the *resolved* path: a relative "x" must not slip past the
+        // protected-path check that only sees the raw string.
+        let resolved = resolve_path(&self.security, path);
+        let resolved_str = resolved.display().to_string();
 
         // Refuse obviously catastrophic targets outright. This is a coarse guard,
         // not a full sandbox — the real confinement for sandboxed workers is the
         // seccomp/rlimit layer; here we just stop trivially fatal mistakes.
-        let trimmed = path.trim_end_matches('/');
+        let trimmed = resolved_str.trim_end_matches('/');
         if trimmed.is_empty()
             || matches!(trimmed, "/" | "/bin" | "/etc" | "/usr" | "/var" | "/boot" | "/lib" | "/sys" | "/proc" | "/dev")
-            || path == std::env::var("HOME").unwrap_or_default()
+            || resolved_str == std::env::var("HOME").unwrap_or_default()
         {
             return Ok(json!({
                 "error": "refused",
-                "message": format!("refusing to delete protected path '{}'", path),
+                "message": format!("refusing to delete protected path '{}'", resolved_str),
             }));
         }
 
-        let meta = tokio::fs::symlink_metadata(path)
+        let meta = tokio::fs::symlink_metadata(&resolved)
             .await
-            .with_context(|| format!("stat {}", path))?;
+            .with_context(|| format!("stat {}", resolved_str))?;
 
         if meta.is_dir() {
             if recursive {
-                tokio::fs::remove_dir_all(path).await.with_context(|| format!("remove_dir_all {}", path))?;
+                tokio::fs::remove_dir_all(&resolved).await.with_context(|| format!("remove_dir_all {}", resolved_str))?;
             } else {
-                tokio::fs::remove_dir(path).await.with_context(|| format!("remove_dir {} (use recursive=true for non-empty)", path))?;
+                tokio::fs::remove_dir(&resolved).await.with_context(|| format!("remove_dir {} (use recursive=true for non-empty)", resolved_str))?;
             }
         } else {
-            tokio::fs::remove_file(path).await.with_context(|| format!("remove_file {}", path))?;
+            tokio::fs::remove_file(&resolved).await.with_context(|| format!("remove_file {}", resolved_str))?;
         }
 
-        Ok(json!({"path": path, "deleted": true, "was_dir": meta.is_dir()}))
+        Ok(json!({"path": resolved_str, "deleted": true, "was_dir": meta.is_dir()}))
     }
 }
 

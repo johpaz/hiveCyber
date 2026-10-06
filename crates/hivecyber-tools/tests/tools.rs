@@ -593,3 +593,93 @@ fn test_security_context_validate_decimal_ipv4() {
     );
     assert!(sec.validate_target("0x7f000001").is_ok(), "0x7f000001 == 127.0.0.1");
 }
+// Relative paths resolve against the task's scratch dir (`task_root`), not the
+// process cwd. Write, read, edit, list and delete must all agree on the same
+// location — otherwise a task could write somewhere it can't read back.
+#[tokio::test]
+async fn test_fs_relative_paths_resolve_against_task_root() {
+    let root = std::env::temp_dir().join(format!("hc_taskroot_{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let sec = Arc::new(SecurityContext {
+        unsafe_mode: false,
+        allowlist_hosts: vec![],
+        operator_id: "test".into(),
+        engagement_policy: None,
+        human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        allow_cli_exec: false,
+        task_root: Some(root.clone()),
+    });
+    let reg = ToolRegistry::create_with_security(sec);
+
+    reg.get("fs_write").unwrap().clone()
+        .execute(serde_json::json!({ "path": "notas/reporte.txt", "content": "uno\ndos\n" }))
+        .await
+        .unwrap();
+    // Landed under the scratch dir, not the process cwd.
+    assert!(root.join("notas/reporte.txt").exists());
+    assert!(!std::path::Path::new("notas/reporte.txt").exists());
+
+    let read = reg.get("fs_read").unwrap().clone()
+        .execute(serde_json::json!({ "path": "notas/reporte.txt" }))
+        .await
+        .unwrap();
+    assert_eq!(read["total_lines"], 2);
+
+    reg.get("fs_edit").unwrap().clone()
+        .execute(serde_json::json!({ "path": "notas/reporte.txt", "old": "dos", "new": "DOS" }))
+        .await
+        .unwrap();
+    let content = tokio::fs::read_to_string(root.join("notas/reporte.txt")).await.unwrap();
+    assert!(content.contains("DOS"));
+
+    let exists = reg.get("fs_exists").unwrap().clone()
+        .execute(serde_json::json!({ "path": "notas/reporte.txt" }))
+        .await
+        .unwrap();
+    assert_eq!(exists["exists"], true);
+
+    let listing = reg.get("fs_list").unwrap().clone()
+        .execute(serde_json::json!({ "path": "notas" }))
+        .await
+        .unwrap();
+    assert_eq!(listing["count"], 1);
+
+    // The protected-path guard sees the *resolved* path: "." resolves to the
+    // scratch root, which is not protected, so this deletes only the file.
+    reg.get("fs_delete").unwrap().clone()
+        .execute(serde_json::json!({ "path": "notas/reporte.txt" }))
+        .await
+        .unwrap();
+    assert!(!root.join("notas/reporte.txt").exists());
+
+    tokio::fs::remove_dir_all(&root).await.ok();
+}
+
+// Absolute paths are not rewritten: task_root is a default working directory,
+// not a jail (containment is the separate, later hardening pass).
+#[tokio::test]
+async fn test_fs_absolute_paths_ignore_task_root() {
+    let root = std::env::temp_dir().join(format!("hc_taskroot_abs_{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let sec = Arc::new(SecurityContext {
+        unsafe_mode: false,
+        allowlist_hosts: vec![],
+        operator_id: "test".into(),
+        engagement_policy: None,
+        human_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        allow_cli_exec: false,
+        task_root: Some(root.clone()),
+    });
+    let reg = ToolRegistry::create_with_security(sec);
+
+    let target = tmp_path("abs_bypass.txt");
+    reg.get("fs_write").unwrap().clone()
+        .execute(serde_json::json!({ "path": target.to_string_lossy(), "content": "x" }))
+        .await
+        .unwrap();
+    assert!(target.exists());
+    assert!(!root.join(target.file_name().unwrap()).exists());
+
+    let _ = tokio::fs::remove_file(&target).await;
+    tokio::fs::remove_dir_all(&root).await.ok();
+}

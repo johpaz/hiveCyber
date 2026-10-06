@@ -282,13 +282,13 @@ impl ToolRegistry {
 
         let sec = security.clone();
         let base_tools: Vec<std::sync::Arc<dyn Tool>> = vec![
-            std::sync::Arc::new(base::FsRead),
-            std::sync::Arc::new(base::FsWrite),
-            std::sync::Arc::new(base::FsEdit),
-            std::sync::Arc::new(base::FsGlob),
-            std::sync::Arc::new(base::FsExists),
-            std::sync::Arc::new(base::FsList),
-            std::sync::Arc::new(base::FsDelete),
+            std::sync::Arc::new(base::FsRead::new(sec.clone())),
+            std::sync::Arc::new(base::FsWrite::new(sec.clone())),
+            std::sync::Arc::new(base::FsEdit::new(sec.clone())),
+            std::sync::Arc::new(base::FsGlob::new(sec.clone())),
+            std::sync::Arc::new(base::FsExists::new(sec.clone())),
+            std::sync::Arc::new(base::FsList::new(sec.clone())),
+            std::sync::Arc::new(base::FsDelete::new(sec.clone())),
             std::sync::Arc::new(base::WebFetch),
             std::sync::Arc::new(base::WebSearch),
             std::sync::Arc::new(base::CliExec::new(sec.clone())),
