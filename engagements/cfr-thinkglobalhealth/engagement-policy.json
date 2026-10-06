@@ -1,0 +1,38 @@
+{
+  "program": "bugcrowd-cfr-thinkglobalhealth-starter-2026",
+  "targets": [
+    {
+      "host": "thinkglobalhealth.org",
+      "paths": ["/**"],
+      "methods": ["GET", "HEAD"],
+      "rate_limit_rps": 1.0,
+      "only_own_accounts": true
+    }
+  ],
+  "excluded": [
+    "www.cfr.org",
+    "cfr.org",
+    "education.cfr.org",
+    "foreignaffairs.com",
+    "subscribe.foreignaffairs.com",
+    "subs.foreignaffairs.com",
+    "world101.cfr.org",
+    "modeldiplomacy.cfr.org"
+  ],
+  "prohibited": [
+    "denial_of_service",
+    "credential_stuffing",
+    "social_engineering",
+    "automated_scanning",
+    "data_access",
+    "destructive_test",
+    "social_media_contact",
+    "physical_testing"
+  ],
+  "require_human_approval": [
+    "exploit",
+    "data_access",
+    "destructive_test",
+    "credential_use"
+  ]
+}

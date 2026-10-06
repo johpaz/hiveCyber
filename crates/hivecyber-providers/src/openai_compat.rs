@@ -14,8 +14,12 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     pub fn new(api_key: &str, model: &str, base_url: &str) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         OpenAiCompatProvider {
-            client: Client::new(),
+            client,
             api_key: api_key.to_string(),
             model: model.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -30,6 +34,11 @@ struct OpenAiRequest {
     messages: Vec<OpenAiMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
+    /// Disable chain-of-thought for reasoning models (Qwen3) served by
+    /// llama-server. Sent only for local endpoints to avoid breaking remote
+    /// OpenAI-compat APIs that might reject unknown fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -73,6 +82,10 @@ struct OpenAiChoice {
 struct OpenAiRespMessage {
     content: Option<String>,
     tool_calls: Option<Vec<OpenAiToolCall>>,
+    /// Some OpenAI-compat servers (llama-server with Qwen3 reasoning models)
+    /// put the model's chain-of-thought here, separate from `content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -160,11 +173,25 @@ impl LlmProvider for OpenAiCompatProvider {
             })
             .collect();
 
+        // Disable thinking mode for local llama-server endpoints (Qwen3
+        // reasoning models). The flag is harmless for servers that don't
+        // understand it (it's just an extra JSON field they'll ignore), but
+        // we only send it for localhost to be safe with remote APIs.
+        let is_local = self.base_url.contains("127.0.0.1")
+            || self.base_url.contains("localhost")
+            || self.base_url.contains("0.0.0.0");
+        let chat_template_kwargs = if is_local {
+            Some(serde_json::json!({"enable_thinking": false}))
+        } else {
+            None
+        };
+
         let body = OpenAiRequest {
             model: self.model.clone(),
             max_tokens: req.max_tokens.unwrap_or(8192),
             messages,
             tools,
+            chat_template_kwargs,
         };
 
         let resp = self
@@ -194,7 +221,21 @@ impl LlmProvider for OpenAiCompatProvider {
 
         let mut content = Vec::new();
         if let Some(text) = choice.message.content {
-            content.push(ContentBlock::Text { text });
+            if !text.is_empty() {
+                content.push(ContentBlock::Text { text });
+            }
+        }
+
+        // If the model produced reasoning but no visible content (common with
+        // Qwen3 reasoning models when they stop mid-thought), surface the
+        // reasoning as the content so the loop can act on it instead of seeing
+        // an empty response and terminating prematurely.
+        if content.is_empty() {
+            if let Some(reasoning) = choice.message.reasoning_content {
+                if !reasoning.is_empty() {
+                    content.push(ContentBlock::Text { text: reasoning });
+                }
+            }
         }
 
         let mut tool_calls = Vec::new();

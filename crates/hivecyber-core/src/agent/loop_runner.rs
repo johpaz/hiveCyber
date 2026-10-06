@@ -255,6 +255,17 @@ async fn run_loop(
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&ctx);
         }
+        // Surface the connected MCP tools in the system prompt so the
+        // coordinator knows (by name) what capabilities exist even before the
+        // BM25 selector picks them — critical for smaller models that may not
+        // reliably inspect the tool schema.
+        if let Some(mcp) = opts.mcp_manager.as_ref() {
+            let mcp_ctx = crate::agent::routing_context::build_mcp_tools_context(mcp).await;
+            if !mcp_ctx.is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&mcp_ctx);
+            }
+        }
     }
     {
         let skills_ctx = crate::agent::routing_context::build_skill_context(&db, &opts.user_message).await;
@@ -313,6 +324,7 @@ async fn run_loop(
             parameters: serde_json::to_value(t.parameters()).unwrap_or_default(),
         })
         .collect();
+    let mut tool_defs = tool_defs;
 
     let max_iter = opts.max_iterations.max(1);
 
@@ -398,7 +410,7 @@ async fn run_loop(
             system: Some(system_prompt.to_string()),
             messages: messages.clone(),
             tools: tool_defs.clone(),
-            max_tokens: Some(8192),
+            max_tokens: Some(16384),
         };
 
         let response = client.call(&req).await?;
@@ -536,6 +548,15 @@ async fn run_loop(
                 format!("Error: {}", result.error.as_deref().unwrap_or("unknown"))
             };
 
+            // Cap tool results so a single huge MCP response (e.g. a full brief
+            // JSON) doesn't dominate the context window and starve the model.
+            const MAX_TOOL_RESULT_CHARS: usize = 8000;
+            let result_str = if result_str.len() > MAX_TOOL_RESULT_CHARS {
+                format!("{}…[truncado: {} chars totales]", &result_str[..MAX_TOOL_RESULT_CHARS], result_str.len())
+            } else {
+                result_str
+            };
+
             messages.push(hivecyber_providers::Message {
                 role: "tool".into(),
                 content: Content::ToolResult {
@@ -544,6 +565,46 @@ async fn run_loop(
                     content: result_str,
                 },
             });
+        }
+
+        // Per-turn tool re-injection: the coordinator can discover mid-conversation
+        // that it needs a tool it didn't have at the start (e.g. an MCP tool the
+        // initial BM25 missed). Re-run the selector on the latest assistant text
+        // + the original request and merge any newly-relevant tools into the
+        // active set. This only ever ADDS tools — the coordinator can never lose
+        // a tool it already had — so mid-flight tool_use/tool_result pairs stay
+        // valid and the `task_*` base is preserved.
+        if role == "coordinator" {
+            let last_text = response.content_text().unwrap_or_default();
+            if !last_text.is_empty() {
+                let requery = format!("{} {}", opts.user_message, last_text);
+                let re_sel = crate::agent::tool_selector::select_tools(&requery, &descriptors);
+                let before = active_names.len();
+                for name in &re_sel.selected {
+                    if active_names.insert(name.clone()) {
+                        continue;
+                    }
+                }
+                if active_names.len() > before {
+                    tracing::debug!(
+                        "tool-selector (turn {}): injected {} new tool(s) → {} of {} active",
+                        iteration + 1,
+                        active_names.len() - before,
+                        active_names.len(),
+                        descriptors.len()
+                    );
+                    tool_defs = tool_registry
+                        .all()
+                        .iter()
+                        .filter(|t| active_names.contains(t.name()))
+                        .map(|t| hivecyber_providers::ToolDef {
+                            name: t.name().into(),
+                            description: t.description().into(),
+                            parameters: serde_json::to_value(t.parameters()).unwrap_or_default(),
+                        })
+                        .collect();
+                }
+            }
         }
     }
 

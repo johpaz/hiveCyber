@@ -515,6 +515,78 @@ impl Tool for WebFetch {
     }
 }
 
+pub struct WebHead;
+
+#[async_trait]
+impl Tool for WebHead {
+    fn name(&self) -> &str { "web_head" }
+    fn description(&self) -> &str {
+        "Realiza HTTP HEAD a una URL y retorna status + response headers (sin body). Util para inspeccionar security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, Server, X-Powered-By)."
+    }
+    fn category(&self) -> ToolCategory { ToolCategory::Base }
+    fn parameters(&self) -> ToolSchema {
+        let mut props = HashMap::new();
+        props.insert("url".into(), json!({"type": "string", "description": "URL absoluta"}));
+        props.insert("method".into(), json!({
+            "type": "string", "default": "head", "enum": ["head", "get"],
+            "description": "Usa 'get' si el servidor no soporta HEAD (algunos CDN devuelven 405/501)"
+        }));
+        ToolSchema {
+            schema_type: "object".into(),
+            properties: props,
+            required: Some(vec!["url".into()]),
+        }
+    }
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let p = read_params(&params)?;
+        let url = p.get("url").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("url required"))?;
+        let method = get_str(&p, "method", "head");
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()?;
+
+        let started = std::time::Instant::now();
+        let req = if method == "get" { client.get(url) } else { client.head(url) };
+        let resp = req.send().await?;
+        let elapsed_ms = started.elapsed().as_millis();
+
+        let status = resp.status();
+        let mut headers_map = serde_json::Map::new();
+        for (name, value) in resp.headers().iter() {
+            let key = name.as_str().to_lowercase();
+            let val = value.to_str().unwrap_or("").to_string();
+            if let Some(existing) = headers_map.get_mut(&key) {
+                if let Some(arr) = existing.as_array_mut() {
+                    arr.push(json!(val));
+                } else {
+                    let prev = existing.take();
+                    headers_map.insert(key, json!([prev, val]));
+                }
+            } else {
+                headers_map.insert(key, json!(val));
+            }
+        }
+
+        let body_preview = if method == "get" {
+            // Para GET-si-HEAD-falla: descartamos el body pero guardamos los bytes.
+            let bytes = resp.bytes().await.unwrap_or_default();
+            bytes.len()
+        } else {
+            0
+        };
+
+        Ok(json!({
+            "url": url,
+            "method": method,
+            "status": status.as_u16(),
+            "headers": headers_map,
+            "elapsed_ms": elapsed_ms,
+            "body_bytes": body_preview,
+        }))
+    }
+}
+
 fn strip_html(html: &str) -> String {
     let mut result = String::new();
     let mut in_tag = false;

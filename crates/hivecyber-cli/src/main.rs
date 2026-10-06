@@ -84,6 +84,10 @@ enum Commands {
     Resume {
         run_id: String,
     },
+    /// Daemon persistente: drena la DurableQueue indefinidamente (sin
+    /// coordinator interactivo). Útil como servicio systemd para que los
+    /// jobs delegados progrese aunque ninguna sesión `chat`/`run` esté viva.
+    Daemon,
     Doctor,
     /// Genera un firewall de egreso nftables (default-deny) desde la
     /// EngagementPolicy (--engagement-policy). Solo permite los targets + DNS.
@@ -260,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Logs => cmd_logs(db.clone()).await,
         Commands::Runs => cmd_runs(db.clone()).await,
         Commands::Resume { run_id } => cmd_resume(db.clone(), &config, &run_id, security.clone()).await,
+        Commands::Daemon => cmd_daemon(db.clone(), &config, security.clone()).await,
         Commands::Doctor => cmd_doctor().await,
         Commands::EgressRules { allow, resolver, resolve_hosts } => {
             cmd_egress_rules(security.clone(), allow, resolver, resolve_hosts).await
@@ -469,7 +474,7 @@ async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Ar
             agent_id: agent_id.to_string(),
             user_message: input.to_string(),
             thread_id: thread_id.clone(),
-            max_iterations: std::cmp::min(max_iter, 10),
+            max_iterations: std::cmp::min(max_iter, 40),
             security: security.clone(),
             queue: Some(dispatch.queue()),
             mcp_manager: mcp.clone(),
@@ -539,11 +544,20 @@ async fn cmd_run(
     let active = install_terminal_hook(db.clone(), config.clone(), security.clone(), dispatch.queue(), mcp.clone());
     dispatch.clone().start().await;
 
+    let agent = db
+        .get(hivecyber_core::store::collections::COL_AGENTS, agent_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("agent '{}' not found. Run `hivecyber agent list`", agent_id))?;
+    let max_iter = agent
+        .get("max_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as u32;
+
     let opts = hivecyber_core::agent::loop_runner::AgentLoopOptions {
         agent_id: agent_id.to_string(),
         user_message: prompt.to_string(),
         thread_id: thread_id.clone(),
-        max_iterations: 10,
+        max_iterations: std::cmp::min(max_iter, 40),
         security: security.clone(),
         queue: Some(dispatch.queue()),
         mcp_manager: mcp.clone(),
@@ -573,6 +587,76 @@ async fn cmd_run(
     }
 
     dispatch.stop().await;
+    Ok(())
+}
+
+async fn cmd_daemon(
+    db: Arc<HiveDb>,
+    config: &Config,
+    security: Arc<hivecyber_tools::SecurityContext>,
+) -> anyhow::Result<()> {
+    use tokio::signal;
+
+    ensure_seed_agents(&db, config).await?;
+    sync_skills_to_db(&db, config).await;
+    hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
+
+    let mcp = init_mcp(&db, config).await;
+
+    let dispatch = std::sync::Arc::new(hivecyber_core::harness::DispatchLoop::new(
+        (*db).clone(),
+        config.clone(),
+    )
+    .with_security(security.clone())
+    .with_mcp(mcp.clone()));
+    let _active = install_terminal_hook(
+        db.clone(),
+        config.clone(),
+        security.clone(),
+        dispatch.queue(),
+        mcp.clone(),
+    );
+    dispatch.clone().start().await;
+
+    println!(
+        "hivecyber daemon: drenando DurableQueue con security unsafe={} policy={}",
+        security.unsafe_mode,
+        security.engagement_policy.is_some(),
+    );
+
+    // Block forever until SIGINT/SIGTERM. The dispatcher's polling loop (500ms)
+    // does all the work; `handle_job_completion` (registered via the terminal
+    // hook) feeds worker deliveries back to the coordinator autonomously.
+    let stop = std::sync::Arc::new(tokio::sync::Mutex::new(false));
+    let stop_outer = stop.clone();
+
+    let ctrl_c = tokio::spawn(async move {
+        let _ = signal::ctrl_c().await;
+        let mut s = stop_outer.lock().await;
+        *s = true;
+    });
+
+    let term_stop = stop.clone();
+    let term = tokio::spawn(async move {
+        let mut sig = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        sig.recv().await;
+        let mut s = term_stop.lock().await;
+        *s = true;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    loop {
+        let stopped = *stop.lock().await;
+        if stopped {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    ctrl_c.abort();
+    term.abort();
+    dispatch.stop().await;
+    println!("hivecyber daemon: apagando");
     Ok(())
 }
 

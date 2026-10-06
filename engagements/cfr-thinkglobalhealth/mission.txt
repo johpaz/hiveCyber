@@ -1,0 +1,19 @@
+Usa el MCP bugcrowd-rewards y llama bugcrowd_get_public_brief con el codigo cfr.
+Confirma que el programa sigue abierto y que thinkglobalhealth.org continua en alcance.
+Si cualquiera de esas condiciones no se cumple, detente sin contactar ningun objetivo.
+
+Realiza solamente reconocimiento inicial pasivo y no intrusivo sobre
+https://thinkglobalhealth.org/:
+
+- como maximo una solicitud por segundo;
+- solo GET o HEAD y sin rastreo recursivo;
+- no uses scanners automaticos, fuzzing, fuerza bruta ni payloads;
+- no inicies sesion, no crees cuentas, no envies formularios y no uses credenciales;
+- no sigas enlaces o redirecciones hacia hosts de terceros;
+- no accedas, modifiques ni retengas datos de otras personas;
+- no intentes explotar ninguna observacion.
+
+Entrega: evidencia de las solicitudes realizadas, tecnologias observadas con nivel de
+confianza, superficie visible y tres hipotesis manuales de bajo riesgo para una siguiente
+sesion. No declares una vulnerabilidad sin evidencia reproducible. Si aparece una posible
+vulnerabilidad, guardala solo como borrador local mediante bugcrowd_save_finding_draft.

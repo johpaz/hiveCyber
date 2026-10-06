@@ -75,6 +75,20 @@ pub fn select_tools(message: &str, tools: &[ToolDescriptor]) -> ToolSelection {
         };
     }
 
+    // Tools mentioned explicitly by name in the message survive the BM25 cut
+    // unconditionally. Token dilution (long missions, many tools) can deprioritize
+    // an otherwise-perfect match — and an explicit mention like "llama
+    // bugcrowd_get_public_brief" must always reach the model.
+    let msg_lower = message.to_lowercase();
+    let explicit: Vec<String> = tools
+        .iter()
+        .filter(|t| {
+            let nm = t.name.to_lowercase();
+            nm.len() >= 3 && msg_lower.contains(&nm)
+        })
+        .map(|t| t.name.clone())
+        .collect();
+
     let docs: Vec<CapabilityDoc> = tools
         .iter()
         .map(|t| CapabilityDoc {
@@ -102,11 +116,21 @@ pub fn select_tools(message: &str, tools: &[ToolDescriptor]) -> ToolSelection {
 
     let hits = index.search(message, &[CapabilityType::Tool], MAX_TOOLS_PER_TURN * 2);
     let hits = apply_relative_cutoff(hits, RELEVANCE_RATIO);
-    let selected: Vec<String> = hits
+    let mut selected: Vec<String> = hits
         .into_iter()
         .take(MAX_TOOLS_PER_TURN)
         .map(|h| h.raw_id)
         .collect();
+
+    // Merge the explicitly-mentioned tools (de-dup). Explicit mentions bypass
+    // MAX_TOOLS_PER_TURN: a direct operator instruction ("llama
+    // bugcrowd_get_public_brief") must always reach the model — even if the
+    // BM25 already filled 12 slots with other tools.
+    for name in explicit {
+        if !selected.contains(&name) {
+            selected.push(name);
+        }
+    }
 
     if selected.is_empty() {
         return ToolSelection {
@@ -122,7 +146,7 @@ pub fn select_tools(message: &str, tools: &[ToolDescriptor]) -> ToolSelection {
         selected,
         conversational: false,
         matched: true,
-        reasoning: format!("{} tools seleccionadas por relevancia BM25", n),
+        reasoning: format!("{} tools seleccionadas por relevancia BM25 (incluye menciones explicitas)", n),
     }
 }
 
@@ -179,5 +203,23 @@ mod tests {
         assert!(!sel.conversational);
         assert!(!sel.matched);
         assert!(sel.selected.is_empty());
+    }
+
+    #[test]
+    fn explicit_tool_mention_survives_bm25_cutoff() {
+        // A mission instructs calling a specific tool by name: that tool must be
+        // in the selection even when surrounding tokens dilute its BM25 score.
+        let mut big_catalog = catalog();
+        big_catalog.push(td(
+            "bugcrowd_get_public_brief",
+            "mcp",
+            "Lee el brief publico vigente: estado, safe harbor, scope, targets, recompensas y reglas.",
+        ));
+        let mission = "Llama bugcrowd_get_public_brief con el codigo cfr. \
+            Confirma que el programa sigue abierto y que thinkglobalhealth.org continua en alcance. \
+            Realiza reconocimiento inicial pasivo y no intrusivo sobre https://thinkglobalhealth.org/.";
+        let sel = select_tools(mission, &big_catalog);
+        assert!(sel.selected.contains(&"bugcrowd_get_public_brief".to_string()));
+        assert!(sel.matched);
     }
 }
