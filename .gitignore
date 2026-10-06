@@ -32,3 +32,6 @@ Thumbs.db
 # Cerebro: memoria de hallazgos y scope derivado por engagement (privados)
 engagements/*/findings/
 engagements/*/knowledge/
+
+# Engagement de programa vivo: solo local, no commitear
+engagements/chime/
