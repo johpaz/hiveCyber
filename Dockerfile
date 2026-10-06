@@ -9,7 +9,8 @@
 # Run:    docker run --rm -it hivecyber run "Escanea 10.0.0.0/24"
 #
 # Tools NOT in Debian repos (install separately if needed): nuclei, trivy,
-# semgrep, metasploit, crackmapexec, theHarvester, volatility3, zeek, osquery.
+# semgrep, metasploit, crackmapexec, theHarvester, volatility3, zeek, osquery,
+# subfinder, dnsx, httpx, katana, gau, feroxbuster, arjun (ver recon-builder).
 
 # ---- builder ----
 FROM rust:1-bookworm AS builder
@@ -44,10 +45,23 @@ RUN apt-get update \
          dnsutils \
          python3 \
          nftables \
-    && for p in yara sqlmap; do \
+    && for p in yara sqlmap ffuf; do \
          apt-get install -y --no-install-recommends "$p" || echo "skip optional: $p"; \
        done \
     && rm -rf /var/lib/apt/lists/*
+
+# Recon moderno (ProjectDiscovery subfinder/dnsx/httpx/katana, gau). Son
+# binarios de Go que no están en Debian. Etapa opcional y vetada, igual que
+# obscura-builder: descomenta ambos bloques para incluirlos. Los wrappers de
+# `recon/mod.rs` validan el scope y rechazan metacaracteres antes de ejecutarlos.
+#   feroxbuster: binario propio (releases de GitHub); arjun: `pipx install arjun`.
+# FROM golang:1-bookworm AS recon-builder
+# RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@<TAG> \
+#  && go install github.com/projectdiscovery/dnsx/cmd/dnsx@<TAG> \
+#  && go install github.com/projectdiscovery/httpx/cmd/httpx@<TAG> \
+#  && go install github.com/projectdiscovery/katana/cmd/katana@<TAG> \
+#  && go install github.com/lc/gau/v2/cmd/gau@<TAG>
+# (en runtime) COPY --from=recon-builder /go/bin/ /usr/local/bin/
 
 COPY --from=builder /build/target/release/hivecyber /usr/local/bin/hivecyber
 COPY --from=builder /build/target/release/hivecyber-worker /usr/local/bin/hivecyber-worker

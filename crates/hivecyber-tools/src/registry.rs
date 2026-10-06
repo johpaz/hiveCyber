@@ -305,6 +305,16 @@ impl ToolRegistry {
             std::sync::Arc::new(recon::TheHarvester),
             std::sync::Arc::new(recon::Shodan),
             std::sync::Arc::new(recon::ReconNg),
+            // Modern ProjectDiscovery-style asset/web surface discovery.
+            std::sync::Arc::new(recon::Subfinder::new(sec.clone())),
+            std::sync::Arc::new(recon::Dnsx::new(sec.clone())),
+            std::sync::Arc::new(recon::Httpx::new(sec.clone())),
+            std::sync::Arc::new(recon::Katana::new(sec.clone())),
+            std::sync::Arc::new(recon::Gau::new(sec.clone())),
+            // Content/parameter discovery (web_pentester).
+            std::sync::Arc::new(recon::Ffuf::new(sec.clone())),
+            std::sync::Arc::new(recon::Feroxbuster::new(sec.clone())),
+            std::sync::Arc::new(recon::Arjun::new(sec.clone())),
         ];
         for tool in recon_tools {
             reg.register(tool);

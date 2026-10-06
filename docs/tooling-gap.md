@@ -5,6 +5,13 @@ son las que más faltan, mapeadas al worker que las usaría y a cómo encajan en
 (categoría + `Isolation`). Todas son OSS conocidas y no destructivas (recon/descubrimiento),
 salvo donde se indica.
 
+> **Estado.** Integradas (wrappers en `recon/mod.rs`, validan scope y rechazan metacaracteres
+> de shell en los flags): `subfinder`, `dnsx`, `httpx`, `katana`, `gau` (categoría `Recon`,
+> `recon_operator`) y `ffuf`, `feroxbuster`, `arjun` (categoría `Web`, `web_pentester`). Los
+> binarios van en una etapa `recon-builder` opcional del `Dockerfile`.
+> Pendientes (otra forma de seguridad — repos o endpoints LLM, no host/scope): `jsluice`,
+> `trufflehog`, `gitleaks`, `garak`, `promptfoo`, Caido/mitmproxy y las de cloud.
+
 ## Recon de activos y superficie web
 El `recon_operator` hoy tiene nmap/dig/whois/theHarvester/shodan/recon-ng. nmap no cubre bien
 el descubrimiento de **activos web**:

@@ -1857,14 +1857,15 @@ async fn cmd_audit(db: Arc<HiveDb>, action: AuditCommands) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Bases creadas antes del cerebro no tienen `knowledge_search` en la allowlist
-/// de los workers del catálogo. Lo añade (solo a agentes `source=catalog` que
-/// ya tienen allowlist y no la tienen), sin tocar nada más de lo editado.
+/// Bases sembradas con una versión anterior no tienen las herramientas que el
+/// catálogo añadió después (p. ej. `knowledge_search`, `finding_record` o los
+/// wrappers de recon modernos). Añade a cada agente `source=catalog` las
+/// herramientas de su persona que le falten, preservando el resto de la
+/// allowlist y sin tocar agentes editados por el usuario (`source` != catalog).
 async fn backfill_catalog_tools(db: &HiveDb) {
     use hivecyber_core::store::collections::COL_AGENTS;
-    const TOOL: &str = "knowledge_search";
     for persona in catalog::catalog_personas() {
-        if !persona.tool_allowlist.iter().any(|t| t == TOOL) {
+        if persona.tool_allowlist.is_empty() {
             continue;
         }
         let Some(mut agent) = db.get(COL_AGENTS, &persona.id).await else { continue };
@@ -1874,10 +1875,18 @@ async fn backfill_catalog_tools(db: &HiveDb) {
         let Some(list) = agent.get_mut("tool_allowlist_json").and_then(|v| v.as_array_mut()) else {
             continue;
         };
-        if list.iter().any(|t| t.as_str() == Some(TOOL)) {
+        let present: std::collections::HashSet<&str> =
+            list.iter().filter_map(|t| t.as_str()).collect();
+        let missing: Vec<serde_json::Value> = persona
+            .tool_allowlist
+            .iter()
+            .filter(|t| !present.contains(t.as_str()))
+            .map(|t| serde_json::json!(t))
+            .collect();
+        if missing.is_empty() {
             continue;
         }
-        list.insert(0, serde_json::json!(TOOL));
+        list.extend(missing);
         let _ = db.insert(COL_AGENTS, &persona.id, agent).await;
     }
 }
@@ -1986,20 +1995,16 @@ mod backfill_tests {
     use hivecyber_core::store::collections::COL_AGENTS;
 
     #[tokio::test]
-    async fn backfill_adds_knowledge_search_only_to_catalog_agents_missing_it() {
+    async fn backfill_adds_missing_catalog_tools_preserving_user_agents() {
         let dir = std::env::temp_dir().join(format!("hc_bf_{}", uuid::Uuid::new_v4()));
         let db = HiveDb::open(&dir).await.unwrap();
-        // Agente de catalogo sembrado antes del cerebro (allowlist sin la tool).
-        db.insert(COL_AGENTS, "report_writer", serde_json::json!({
-            "id": "report_writer", "source": "catalog", "tool_allowlist_json": ["fs_read"]
+        // Agente de catalogo sembrado antes (allowlist incompleta).
+        db.insert(COL_AGENTS, "recon_operator", serde_json::json!({
+            "id": "recon_operator", "source": "catalog", "tool_allowlist_json": ["nmap"]
         })).await.unwrap();
-        // Agente del usuario con el mismo id de persona: no se toca.
+        // Agente del usuario con el mismo id de persona: intacto.
         db.insert(COL_AGENTS, "web_pentester", serde_json::json!({
-            "id": "web_pentester", "source": "user", "tool_allowlist_json": ["fs_read"]
-        })).await.unwrap();
-        // Ya la tiene: no se duplica.
-        db.insert(COL_AGENTS, "vuln_scanner", serde_json::json!({
-            "id": "vuln_scanner", "source": "catalog", "tool_allowlist_json": ["knowledge_search", "fs_read"]
+            "id": "web_pentester", "source": "user", "tool_allowlist_json": ["nikto"]
         })).await.unwrap();
 
         backfill_catalog_tools(&db).await;
@@ -2009,9 +2014,14 @@ mod backfill_tests {
             v["tool_allowlist_json"].as_array().unwrap().iter()
                 .map(|t| t.as_str().unwrap().to_string()).collect()
         };
-        assert_eq!(list(db.get(COL_AGENTS, "report_writer").await.unwrap()), ["knowledge_search", "fs_read"]);
-        assert_eq!(list(db.get(COL_AGENTS, "web_pentester").await.unwrap()), ["fs_read"]);
-        assert_eq!(list(db.get(COL_AGENTS, "vuln_scanner").await.unwrap()), ["knowledge_search", "fs_read"]);
+        let recon = list(db.get(COL_AGENTS, "recon_operator").await.unwrap());
+        assert_eq!(recon.iter().filter(|t| *t == "nmap").count(), 1, "no duplica lo existente");
+        assert!(recon.contains(&"knowledge_search".to_string()));
+        for added in ["subfinder", "httpx", "katana", "gau"] {
+            assert!(recon.contains(&added.to_string()), "falta {added}: {recon:?}");
+        }
+        // El agente del usuario no se toca.
+        assert_eq!(list(db.get(COL_AGENTS, "web_pentester").await.unwrap()), ["nikto"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
