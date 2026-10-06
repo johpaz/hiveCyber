@@ -484,7 +484,8 @@ async fn run_loop(
                 })
                 .await;
 
-            if let Some(intervention) = stuck.record_tool_call(&tool_call.name) {
+            let args_sig = super::stuck::hash_args(&tool_call.arguments.to_string());
+            if let Some(intervention) = stuck.record_tool_call(&tool_call.name, &args_sig) {
                 let _ = tx.send(StreamChunk::Agent { text: intervention }).await;
             }
         }

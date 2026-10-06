@@ -29,3 +29,6 @@ Thumbs.db
 
 # DB test artifacts
 /tmp/hc_test_db_*
+# Cerebro: memoria de hallazgos y scope derivado por engagement (privados)
+engagements/*/findings/
+engagements/*/knowledge/

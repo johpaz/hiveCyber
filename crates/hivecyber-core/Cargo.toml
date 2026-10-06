@@ -24,6 +24,7 @@ hivecyber-tools = { path = "../hivecyber-tools" }
 hivecyber-mcp = { path = "../hivecyber-mcp" }
 hivecyber-skills = { path = "../hivecyber-skills" }
 tantivy = "0.22"
+hivedb-core = { workspace = true }
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"

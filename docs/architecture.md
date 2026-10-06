@@ -21,6 +21,8 @@ hiveCyber/
 └── docs/                   (esta documentacion)
 ```
 
+> Capa de conocimiento (playbooks, scope, memoria de hallazgos, dedup gate): ver [brain.md](brain.md) y [tooling-gap.md](tooling-gap.md).
+
 ## Flujo de alto nivel
 
 ```

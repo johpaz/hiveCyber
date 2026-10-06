@@ -1,0 +1,47 @@
+{
+  "program": "acme-bbp",
+  "targets": [
+    {
+      "host": "api.acme.com",
+      "paths": ["/api/**"],
+      "methods": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+      "rate_limit_rps": 4.0,
+      "only_own_accounts": true
+    },
+    {
+      "host": "*.acme.com",
+      "paths": ["/app/**"],
+      "methods": ["GET", "HEAD"],
+      "rate_limit_rps": 2.0,
+      "only_own_accounts": true
+    }
+  ],
+  "excluded": [
+    "blog.acme.com",
+    "status.acme.com"
+  ],
+  "prohibited": [
+    "denial_of_service",
+    "social_engineering",
+    "automated_scanning",
+    "data_access",
+    "physical_testing"
+  ],
+  "require_human_approval": [
+    "exploit",
+    "credential_use",
+    "destructive_test"
+  ],
+  "time_windows": {
+    "allowed_days": ["mon", "tue", "wed", "thu", "fri"],
+    "allowed_hours_utc": [14, 1]
+  },
+  "ai_policy": {
+    "disclosure_required": true,
+    "autonomous_submission_allowed": false
+  },
+  "knowledge": {
+    "ingest_scope_on_load": true,
+    "dedup_threshold": 0.72
+  }
+}

@@ -146,22 +146,22 @@ fn test_catalog_coordinator_prompt_exists() {
 #[test]
 fn test_stuck_loop_detects_repeat() {
     let mut detector = StuckLoopDetector::new();
-    assert!(detector.record_tool_call("nmap").is_none());
-    assert!(detector.record_tool_call("nmap").is_none());
-    assert!(detector.record_tool_call("nmap").is_none());
-    let intervention = detector.record_tool_call("nmap");
+    assert!(detector.record_tool_call("nmap", "{}").is_none());
+    assert!(detector.record_tool_call("nmap", "{}").is_none());
+    assert!(detector.record_tool_call("nmap", "{}").is_none());
+    let intervention = detector.record_tool_call("nmap", "{}");
     assert!(intervention.is_some(), "should detect 4-repeat stuck loop");
 }
 
 #[test]
 fn test_stuck_loop_resets_on_different_tool() {
     let mut detector = StuckLoopDetector::new();
-    detector.record_tool_call("nmap");
-    detector.record_tool_call("nmap");
-    detector.record_tool_call("dig");
-    assert!(detector.record_tool_call("dig").is_none());
-    assert!(detector.record_tool_call("dig").is_none());
-    let intervention = detector.record_tool_call("dig");
+    detector.record_tool_call("nmap", "{}");
+    detector.record_tool_call("nmap", "{}");
+    detector.record_tool_call("dig", "{}");
+    assert!(detector.record_tool_call("dig", "{}").is_none());
+    assert!(detector.record_tool_call("dig", "{}").is_none());
+    let intervention = detector.record_tool_call("dig", "{}");
     assert!(intervention.is_some());
 }
 

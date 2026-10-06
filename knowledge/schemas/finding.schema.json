@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Finding",
+  "description": "Hallazgo tipado que escribe un worker al cerrar un EvidenceItem. Se ingiere en COL_KNOWLEDGE (kind=finding) y alimenta el gate de deduplicación.",
+  "type": "object",
+  "required": ["id", "program", "vulnerability", "host", "dedup_key", "status", "created_at"],
+  "properties": {
+    "id": { "type": "string", "description": "uuid del finding" },
+    "program": { "type": "string", "description": "slug del engagement" },
+    "vulnerability": {
+      "type": "string",
+      "description": "clase normalizada, p.ej. idor, ssrf, llm-tool-exfil, sqli"
+    },
+    "title": { "type": "string" },
+    "host": { "type": "string" },
+    "endpoint": { "type": "string" },
+    "severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"] },
+    "cvss": { "type": "string", "description": "vector CVSS (skill cvss_scoring)" },
+    "dedup_key": {
+      "type": "string",
+      "description": "clave estable para deduplicar: normalmente hash de (vulnerability + host + endpoint normalizado + parametro). Es lo que consulta el gate antes de reportar."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "needs_human_review", "possible_duplicate", "ready", "submitted", "accepted", "duplicate", "rejected"],
+      "description": "el pipeline se detiene en needs_human_review o possible_duplicate"
+    },
+    "evidence": {
+      "type": "array",
+      "description": "EvidenceItem(s) que respaldan el hallazgo",
+      "items": { "type": "object" }
+    },
+    "reproduction": { "type": "string", "description": "pasos reproducibles (requisito del gate)" },
+    "ai_assisted": { "type": "boolean", "description": "si se usó IA, para declarar según política del programa" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "created_by": { "type": "string", "description": "id del worker" }
+  }
+}

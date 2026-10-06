@@ -37,9 +37,16 @@ async-trait = "0.1"
 tokio-tungstenite = "0.24"
 futures = "0.3"
 libc = "0.2"
+hivedb-core = { git = "https://github.com/johpaz/hiveBD", tag = "v0.5.1" }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# TEMPORAL: hiveBD v0.5.1 + tantivy 0.22 (evita el choque de zstd-sys con tantivy 0.21).
+# Quitar cuando exista un tag upstream (p. ej. v0.5.2) y apuntar la dependencia a ese tag.
+[patch."https://github.com/johpaz/hiveBD"]
+hivedb-core = { path = "/tmp/claude-1000/-data-hiveCyber-review/2747cf57-af5d-4e1c-9f1b-c27d7080d99b/scratchpad/hiveBD/crates/hivedb-core" }
+hivedb-index = { path = "/tmp/claude-1000/-data-hiveCyber-review/2747cf57-af5d-4e1c-9f1b-c27d7080d99b/scratchpad/hiveBD/crates/hivedb-index" }
