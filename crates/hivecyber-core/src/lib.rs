@@ -1,5 +1,6 @@
 pub mod config;
 pub mod store;
+pub mod knowledge;
 pub mod agent;
 pub mod security;
 pub mod tool_runtime;

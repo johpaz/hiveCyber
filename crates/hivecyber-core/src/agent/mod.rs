@@ -12,6 +12,7 @@ pub mod delegation_backend;
 pub mod acceptance;
 pub mod mcp_integration;
 pub mod memory_backend;
+pub mod knowledge_backend;
 pub mod skill_selector;
 pub mod routing_context;
 pub mod compaction;

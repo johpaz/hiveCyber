@@ -115,6 +115,19 @@ impl JobExecutor for WorkerTaskExecutor {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&skills_ctx);
         }
+        // Metodologia / scope / hallazgos previos del cerebro, acotados al
+        // programa del engagement.
+        let program = crate::agent::loop_runner::knowledge_program(&task_security);
+        let knowledge_ctx = crate::agent::routing_context::build_knowledge_context(
+            &self.db,
+            task_description,
+            program.as_deref(),
+        )
+        .await;
+        if !knowledge_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&knowledge_ctx);
+        }
         let provider = agent_val.get("provider_id").and_then(|p| p.as_str())
             .unwrap_or(&self.config.models.default_provider);
         // model_id from the agent, else the global config default, else empty —
@@ -130,6 +143,11 @@ impl JobExecutor for WorkerTaskExecutor {
             .unwrap_or_default();
 
         let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(task_security.clone());
+        crate::agent::knowledge_backend::KnowledgeBackend::register(
+            &mut tool_registry,
+            &self.db,
+            program,
+        );
         // MCP tools are exposed to workers too; the allowlist below still gates
         // which ones this specific worker may call.
         if let Some(mcp) = self.mcp.as_ref() {

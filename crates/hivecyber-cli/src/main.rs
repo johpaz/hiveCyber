@@ -70,6 +70,11 @@ enum Commands {
         #[command(subcommand)]
         action: SkillsCommands,
     },
+    /// Cerebro: playbooks, checklists, scope y hallazgos recuperables (BM25).
+    Knowledge {
+        #[command(subcommand)]
+        action: KnowledgeCommands,
+    },
     Mcp {
         #[command(subcommand)]
         action: McpCommands,
@@ -152,6 +157,30 @@ enum SkillsCommands {
     Reload,
     /// Install a skill by copying its SKILL.md into the managed skills dir.
     Add { path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeCommands {
+    /// Ingiere un directorio de documentos .md con frontmatter (por defecto ./knowledge).
+    Ingest { path: Option<PathBuf> },
+    /// Deriva e ingiere el scope del programa desde --engagement-policy.
+    IngestScope,
+    /// Lista los documentos del cerebro.
+    List {
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Busca en el cerebro.
+    Search {
+        query: String,
+        #[arg(long)]
+        kind: Option<String>,
+        /// Programa (engagement) cuyo conocimiento privado se incluye.
+        #[arg(long)]
+        program: Option<String>,
+        #[arg(short = 'k', long, default_value_t = 5)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -259,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Provider { action } => cmd_provider(db.clone(), &config, action).await,
         Commands::Models { provider } => cmd_models(db.clone(), provider).await,
         Commands::Skills { action } => cmd_skills(db.clone(), &config, action).await,
+        Commands::Knowledge { action } => cmd_knowledge(db.clone(), security.clone(), action).await,
         Commands::Mcp { action } => cmd_mcp(db.clone(), action).await,
         Commands::Config { action } => cmd_config(&config, action).await,
         Commands::Logs => cmd_logs(db.clone()).await,
@@ -410,11 +440,123 @@ async fn sync_skills_to_db(db: &HiveDb, config: &Config) {
     }
 }
 
+/// Bundled knowledge dir (relative to the CLI crate in dev; falls back to ./knowledge).
+fn bundled_knowledge_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../knowledge")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("./knowledge"))
+}
+
+/// Sync the bundled knowledge corpus and, if a named engagement policy is
+/// active, its derived scope document into the brain. Best-effort and
+/// idempotent (upserts), like `sync_skills_to_db`.
+async fn sync_knowledge_to_db(db: &HiveDb, security: &hivecyber_tools::SecurityContext) {
+    let dir = bundled_knowledge_dir();
+    if dir.is_dir() {
+        match hivecyber_core::knowledge::ingest_dir(db, &dir).await {
+            Ok((_, skipped)) => {
+                for s in skipped {
+                    eprintln!("Warning: knowledge omitido: {s}");
+                }
+            }
+            Err(e) => eprintln!("Warning: no se pudo ingerir el conocimiento: {e}"),
+        }
+    }
+    if let Some(doc) = security
+        .engagement_policy
+        .as_ref()
+        .and_then(|p| hivecyber_core::knowledge::scope_doc(p))
+    {
+        if let Err(e) = hivecyber_core::knowledge::ingest(db, &[doc]).await {
+            eprintln!("Warning: no se pudo ingerir el scope: {e}");
+        }
+    }
+}
+
+async fn cmd_knowledge(
+    db: Arc<HiveDb>,
+    security: Arc<hivecyber_tools::SecurityContext>,
+    action: KnowledgeCommands,
+) -> anyhow::Result<()> {
+    use hivecyber_core::knowledge::{self, KnowledgeDoc, KnowledgeKind};
+    use hivecyber_core::store::collections::COL_KNOWLEDGE;
+
+    let parse_kind = |k: &Option<String>| -> anyhow::Result<Option<KnowledgeKind>> {
+        k.as_deref()
+            .map(|k| {
+                serde_json::from_value::<KnowledgeKind>(serde_json::json!(k))
+                    .map_err(|_| anyhow::anyhow!("kind invalido '{k}' (playbook|checklist|scope|finding)"))
+            })
+            .transpose()
+    };
+
+    match action {
+        KnowledgeCommands::Ingest { path } => {
+            let dir = path.unwrap_or_else(bundled_knowledge_dir);
+            let (n, skipped) = knowledge::ingest_dir(&db, &dir).await?;
+            for s in &skipped {
+                eprintln!("omitido: {s}");
+            }
+            println!("{n} documento(s) ingeridos desde {}", dir.display());
+        }
+        KnowledgeCommands::IngestScope => {
+            let doc = security
+                .engagement_policy
+                .as_ref()
+                .and_then(|p| knowledge::scope_doc(p))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "se requiere --engagement-policy <file> con un campo 'program' no vacio"
+                    )
+                })?;
+            println!("scope ingerido: {}", doc.id);
+            knowledge::ingest(&db, &[doc]).await?;
+        }
+        KnowledgeCommands::List { kind } => {
+            let kind = parse_kind(&kind)?;
+            println!("{:<26} {:<10} {:<14} {}", "ID", "KIND", "PROGRAM", "TITLE");
+            for (_, v) in db.list(COL_KNOWLEDGE).await {
+                let Ok(d) = serde_json::from_value::<KnowledgeDoc>(v) else { continue };
+                if kind.is_some_and(|k| k != d.kind) {
+                    continue;
+                }
+                println!(
+                    "{:<26} {:<10} {:<14} {}",
+                    d.id,
+                    d.kind.as_str(),
+                    d.program.as_deref().unwrap_or("-"),
+                    d.title
+                );
+            }
+        }
+        KnowledgeCommands::Search { query, kind, program, limit } => {
+            let kind = parse_kind(&kind)?;
+            let program = program.or_else(|| {
+                security
+                    .engagement_policy
+                    .as_ref()
+                    .map(|p| p.program.clone())
+                    .filter(|p| !p.is_empty())
+            });
+            let hits = knowledge::search(&db, kind, program.as_deref(), &query, limit).await?;
+            if hits.is_empty() {
+                println!("Sin resultados.");
+            }
+            for h in hits {
+                println!("{:>7.2}  {:<10} {:<22} {}", h.score, h.doc.kind.as_str(), h.doc.id, h.doc.title);
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Arc<hivecyber_tools::SecurityContext>) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     ensure_seed_agents(&db, config).await?;
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
 
     let mcp = init_mcp(&db, config).await;
@@ -531,6 +673,7 @@ async fn cmd_run(
 ) -> anyhow::Result<()> {
     ensure_seed_agents(&db, config).await?;
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
 
     let thread_id = uuid::Uuid::new_v4().to_string();
@@ -599,6 +742,7 @@ async fn cmd_daemon(
 
     ensure_seed_agents(&db, config).await?;
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
 
     let mcp = init_mcp(&db, config).await;
@@ -1446,6 +1590,7 @@ async fn cmd_resume(db: Arc<HiveDb>, config: &Config, run_id: &str, security: Ar
     println!("Resuming run {} (agent={}, thread={})", run_id, agent_id, thread_id);
 
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
     let mcp = init_mcp(&db, config).await;
     let loop_runner = AgentLoop::new((*db).clone(), config.clone());
@@ -1670,9 +1815,35 @@ async fn cmd_audit(db: Arc<HiveDb>, action: AuditCommands) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Bases creadas antes del cerebro no tienen `knowledge_search` en la allowlist
+/// de los workers del catálogo. Lo añade (solo a agentes `source=catalog` que
+/// ya tienen allowlist y no la tienen), sin tocar nada más de lo editado.
+async fn backfill_catalog_tools(db: &HiveDb) {
+    use hivecyber_core::store::collections::COL_AGENTS;
+    const TOOL: &str = "knowledge_search";
+    for persona in catalog::catalog_personas() {
+        if !persona.tool_allowlist.iter().any(|t| t == TOOL) {
+            continue;
+        }
+        let Some(mut agent) = db.get(COL_AGENTS, &persona.id).await else { continue };
+        if agent.get("source").and_then(|v| v.as_str()) != Some("catalog") {
+            continue;
+        }
+        let Some(list) = agent.get_mut("tool_allowlist_json").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        if list.iter().any(|t| t.as_str() == Some(TOOL)) {
+            continue;
+        }
+        list.insert(0, serde_json::json!(TOOL));
+        let _ = db.insert(COL_AGENTS, &persona.id, agent).await;
+    }
+}
+
 async fn ensure_seed_agents(db: &HiveDb, config: &Config) -> anyhow::Result<()> {
     let count = db.count(hivecyber_core::store::collections::COL_AGENTS).await;
     if count > 0 {
+        backfill_catalog_tools(db).await;
         return Ok(());
     }
 
@@ -1766,4 +1937,39 @@ fn build_worker_prompt(id: &str, desc: &str) -> String {
         "# HIVECYBER Worker: {}\n\n{}\n\n## Reglas\n- No hablas con el operador.\n- No delegas.\n- No usas tools fuera de tu allowlist.\n- Declaras exito solo con evidencia verificable.\n- Output estructurado: status, what_was_done, artifacts, evidence, risks, question.",
         id, desc
     )
+}
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use hivecyber_core::store::collections::COL_AGENTS;
+
+    #[tokio::test]
+    async fn backfill_adds_knowledge_search_only_to_catalog_agents_missing_it() {
+        let dir = std::env::temp_dir().join(format!("hc_bf_{}", uuid::Uuid::new_v4()));
+        let db = HiveDb::open(&dir).await.unwrap();
+        // Agente de catalogo sembrado antes del cerebro (allowlist sin la tool).
+        db.insert(COL_AGENTS, "report_writer", serde_json::json!({
+            "id": "report_writer", "source": "catalog", "tool_allowlist_json": ["fs_read"]
+        })).await.unwrap();
+        // Agente del usuario con el mismo id de persona: no se toca.
+        db.insert(COL_AGENTS, "web_pentester", serde_json::json!({
+            "id": "web_pentester", "source": "user", "tool_allowlist_json": ["fs_read"]
+        })).await.unwrap();
+        // Ya la tiene: no se duplica.
+        db.insert(COL_AGENTS, "vuln_scanner", serde_json::json!({
+            "id": "vuln_scanner", "source": "catalog", "tool_allowlist_json": ["knowledge_search", "fs_read"]
+        })).await.unwrap();
+
+        backfill_catalog_tools(&db).await;
+        backfill_catalog_tools(&db).await; // idempotente
+
+        let list = |v: serde_json::Value| -> Vec<String> {
+            v["tool_allowlist_json"].as_array().unwrap().iter()
+                .map(|t| t.as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(list(db.get(COL_AGENTS, "report_writer").await.unwrap()), ["knowledge_search", "fs_read"]);
+        assert_eq!(list(db.get(COL_AGENTS, "web_pentester").await.unwrap()), ["fs_read"]);
+        assert_eq!(list(db.get(COL_AGENTS, "vuln_scanner").await.unwrap()), ["knowledge_search", "fs_read"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
