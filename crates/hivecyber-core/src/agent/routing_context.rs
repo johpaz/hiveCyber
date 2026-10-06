@@ -98,6 +98,28 @@ pub async fn build_knowledge_context(db: &HiveDb, message: &str, program: Option
     s
 }
 
+/// Reglas de IA del programa activo para el prompt, o "" sin programa. Es la
+/// parte "blanda" (instrucciones); el bloqueo real del envio lo hace el
+/// middleware (`tool_runtime::middleware::submission_gate`).
+pub fn build_ai_policy_context(policy: Option<&hivecyber_tools::EngagementPolicy>) -> String {
+    let Some(p) = policy.filter(|p| !p.program.trim().is_empty()) else {
+        return String::new();
+    };
+    let mut s = format!("## Politica de IA del programa {}\n", p.program);
+    if p.ai_policy.disclosure_required {
+        s.push_str("- El programa exige declarar el uso de IA: en cada reporte indica que fue asistido por IA.\n");
+    }
+    if p.ai_policy.autonomous_submission_allowed {
+        s.push_str("- El envio autonomo de reportes esta permitido, siempre con reproduccion verificada.\n");
+    } else {
+        s.push_str(
+            "- NO envies reportes a la plataforma. Registra el hallazgo con `finding_record`, deja el informe en borrador y entregalo al operador humano.\n",
+        );
+    }
+    s.push_str("- Antes de reportar, comprueba duplicados: `finding_record` los detecta; no insistas con un hallazgo marcado como duplicado.\n");
+    s
+}
+
 async fn load_roster(db: &HiveDb) -> Vec<RoutableAgent> {
     db.list(COL_AGENTS)
         .await
@@ -217,5 +239,25 @@ mod knowledge_context_tests {
         assert!(acme.contains("(pb-ssrf)") && acme.contains("(scope-acme)"));
         assert!(!acme.contains("scope-otro"), "no debe filtrar el scope de otro programa");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod ai_policy_context_tests {
+    use super::*;
+    use hivecyber_tools::EngagementPolicy;
+
+    #[test]
+    fn ai_policy_block_reflects_the_program_rules() {
+        assert_eq!(build_ai_policy_context(None), "");
+        assert_eq!(build_ai_policy_context(Some(&EngagementPolicy::empty())), "", "sin program no hay bloque");
+
+        let mut p = EngagementPolicy { program: "acme".into(), ..Default::default() };
+        let s = build_ai_policy_context(Some(&p));
+        assert!(s.contains("acme") && s.contains("asistido por IA") && s.contains("NO envies reportes"));
+        p.ai_policy.autonomous_submission_allowed = true;
+        p.ai_policy.disclosure_required = false;
+        let s = build_ai_policy_context(Some(&p));
+        assert!(s.contains("permitido") && !s.contains("asistido por IA") && !s.contains("NO envies"));
     }
 }

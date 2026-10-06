@@ -15,6 +15,54 @@ pub struct EngagementPolicy {
     pub require_human_approval: Vec<ApprovalCategory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_windows: Option<TimeWindow>,
+    /// Reglas del programa sobre el uso de IA (divulgación, envío autónomo).
+    #[serde(default)]
+    pub ai_policy: AiPolicy,
+    /// Parámetros del cerebro (ingesta de scope, umbral de duplicados).
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
+}
+
+/// Política de IA del programa. Los valores por defecto son los conservadores:
+/// declarar el uso de IA y NO enviar reportes de forma autónoma.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiPolicy {
+    #[serde(default = "default_true")]
+    pub disclosure_required: bool,
+    #[serde(default)]
+    pub autonomous_submission_allowed: bool,
+}
+
+impl Default for AiPolicy {
+    fn default() -> Self {
+        AiPolicy { disclosure_required: true, autonomous_submission_allowed: false }
+    }
+}
+
+/// Parámetros del cerebro por programa.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeConfig {
+    /// Ingerir el scope derivado de esta política al arrancar.
+    #[serde(default = "default_true")]
+    pub ingest_scope_on_load: bool,
+    /// Similitud estructurada [0,1] a partir de la cual un hallazgo se marca
+    /// `possible_duplicate` (ver `knowledge::finding::similarity`).
+    #[serde(default = "default_dedup_threshold")]
+    pub dedup_threshold: f32,
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        KnowledgeConfig { ingest_scope_on_load: true, dedup_threshold: default_dedup_threshold() }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_dedup_threshold() -> f32 {
+    0.72
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -603,5 +651,43 @@ mod tests {
         assert!(path_matches("/api/*", "/api/v1/users"));
         assert!(path_matches("/*.txt", "/report.txt"));
         assert!(!path_matches("/*.txt", "/report.csv"));
+    }
+}
+#[cfg(test)]
+mod ai_policy_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_policy_without_new_fields_gets_conservative_defaults() {
+        let p: EngagementPolicy = serde_json::from_str(r#"{"program":"acme","targets":[{"host":"a.com"}]}"#).unwrap();
+        assert!(p.ai_policy.disclosure_required);
+        assert!(!p.ai_policy.autonomous_submission_allowed, "por defecto NO se envia de forma autonoma");
+        assert!(p.knowledge.ingest_scope_on_load);
+        assert_eq!(p.knowledge.dedup_threshold, 0.72);
+        // La politica permisiva derivada de --allowlist-hosts tambien.
+        let q = EngagementPolicy::from_allowlist_hosts(&["a.com".into()]);
+        assert!(!q.ai_policy.autonomous_submission_allowed);
+    }
+
+    #[test]
+    fn explicit_values_override_and_partial_blocks_fill_defaults() {
+        let p: EngagementPolicy = serde_json::from_str(
+            r#"{"program":"x","ai_policy":{"autonomous_submission_allowed":true},"knowledge":{"dedup_threshold":0.9}}"#,
+        )
+        .unwrap();
+        assert!(p.ai_policy.autonomous_submission_allowed);
+        assert!(p.ai_policy.disclosure_required, "campo omitido -> default");
+        assert_eq!(p.knowledge.dedup_threshold, 0.9);
+        assert!(p.knowledge.ingest_scope_on_load);
+    }
+
+    #[test]
+    fn the_shipped_template_parses_with_the_real_struct() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engagements/_template/engagement-policy.json");
+        let p: EngagementPolicy = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(p.program, "acme-bbp");
+        assert_eq!(p.targets.len(), 2);
+        assert!(!p.ai_policy.autonomous_submission_allowed);
+        assert!(p.time_windows.is_some());
     }
 }

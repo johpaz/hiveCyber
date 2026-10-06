@@ -82,30 +82,47 @@ hivecyber knowledge ingest-scope --engagement-policy engagements/acme/engagement
 # hace knowledge.write(kind=finding, program=<slug>, dedup_key=...)
 ```
 
-## Gate de deduplicación (antes de reportar)
+## Gate de deduplicación
 
-El `report_writer` consulta el cerebro **antes** de redactar:
+Los hallazgos viven tipados en `COL_FINDINGS` (autoritativo) y se proyectan como documentos
+`kind=finding` del cerebro. Los workers (`vuln_scanner`, `web_pentester`, `exploit_operator`) los
+registran con la tool **`finding_record`**, que compara con los hallazgos previos *del mismo programa*
+antes de guardar:
 
-1. `knowledge.search(kind=finding, program=<slug>, query=<resumen del hallazgo>)`.
-2. Si hay match sobre un umbral → marca el finding como **posible duplicado** y requiere
-   revisión humana en vez de generar reporte.
-3. Si no → procede, pero exige PoC reproducible (ya tienes acceptance por `EvidenceItem`).
+| Resultado | Condición | Efecto |
+|---|---|---|
+| `duplicate` | misma `dedup_key` | **no se guarda**; devuelve el id original |
+| `possible_duplicate` | similitud ≥ `knowledge.dedup_threshold` (0.72) | se guarda **retenido**; no es reportable |
+| `new` | resto | `draft` si no hay reproducción; si la hay, `needs_human_review` (o `ready` si el programa permite envío autónomo) |
 
-Esto ataca directamente el problema de 2026: las plataformas endurecieron reglas contra el
-volumen de reportes duplicados/IA. El cerebro convierte "no duplicar" en un control, no en
-una esperanza.
+- `dedup_key` = sha256 (24 hex) de programa + clase normalizada + host + endpoint normalizado
+  (`/api/orders/123` → `/api/orders/{id}`) + parámetro. Alias de clase: `BOLA` y `Broken Object Level
+  Authorization` → `idor`.
+- La similitud **no usa el score BM25** (sin cota en modo texto): es
+  `misma_clase × mismo_host × (0.8·jaccard(segmentos del endpoint) + 0.2·mismo_parámetro)`, así que el
+  umbral es interpretable. Mismo endpoint con otro parámetro = 0.8 (posible duplicado); otro endpoint de
+  la misma clase = distinto hallazgo.
+- Un hallazgo `rejected`/`duplicate` previo sigue contando: re-encontrarlo es duplicado.
+- El `report_writer` consulta **`finding_list`** antes de redactar. Esa tool solo devuelve lo reportable
+  (borradores y posibles duplicados quedan fuera, solo se informa cuántos) y adjunta evidencia tipada
+  (`findings_reviewed`) que exige el criterio de aceptación `findings_cleared`.
+- Revisión humana: `hivecyber knowledge findings` y `hivecyber knowledge finding-set <id> <status>`.
 
 ## Política de IA por programa
 
-Añade a la `EngagementPolicy` un campo que el cerebro expone al coordinador:
-
 ```json
-"ai_policy": { "disclosure_required": true, "autonomous_submission_allowed": false }
+"ai_policy": { "disclosure_required": true, "autonomous_submission_allowed": false },
+"knowledge": { "ingest_scope_on_load": true, "dedup_threshold": 0.72 }
 ```
 
-Caelum lo lee vía `routing_context` (como ya hace con `routing_exclusions`) y ajusta el
-comportamiento: si `autonomous_submission_allowed=false`, el pipeline **se detiene en
-borrador** y entrega al operador humano.
+Ambos bloques son opcionales (`#[serde(default)]`); los defaults son los conservadores.
+
+- **Prompt**: coordinador y workers reciben un bloque "Política de IA del programa" (declarar uso de IA;
+  no enviar, dejar en borrador).
+- **Bloqueo real** (`tool_runtime::middleware::submission_gate`): con `autonomous_submission_allowed=false`
+  y una política cargada, las tools de envío (`*submit_finding*`, `*submit_report*`, …; p. ej.
+  `bugcrowd_submit_finding`) se rechazan, y el rechazo queda auditado. El operador puede autorizar un run
+  con `--approve-human submit_report`.
 
 ## Esqueleto de implementación (Rust)
 

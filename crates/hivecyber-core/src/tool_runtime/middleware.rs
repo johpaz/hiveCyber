@@ -16,6 +16,38 @@ pub struct AuditCtx {
     pub operator_id: String,
 }
 
+/// Tools that submit a report to the program's platform (matched on the name,
+/// so MCP-prefixed names such as `bugcrowd_submit_finding` are covered).
+const SUBMISSION_TOOL_MARKERS: &[&str] =
+    &["submit_finding", "submit_report", "submit_vulnerability", "submit_submission"];
+
+/// Approval category an operator grants (`--approve-human submit_report`) to let
+/// a single run submit despite `ai_policy.autonomous_submission_allowed=false`.
+pub const SUBMIT_APPROVAL: &str = "submit_report";
+
+/// `Some(reason)` when `tool_name` is a submission tool and the active program
+/// forbids autonomous submission and no operator approval is on record. Only
+/// applies when an engagement policy is loaded (like the other policy gates).
+pub fn submission_gate(security: &hivecyber_tools::SecurityContext, tool_name: &str) -> Option<String> {
+    let policy = security.engagement_policy.as_ref()?;
+    if policy.ai_policy.autonomous_submission_allowed {
+        return None;
+    }
+    let name = tool_name.to_lowercase();
+    if !SUBMISSION_TOOL_MARKERS.iter().any(|m| name.contains(m)) {
+        return None;
+    }
+    if security.has_human_approval(SUBMIT_APPROVAL) {
+        return None;
+    }
+    Some(format!(
+        "politica del programa '{}': el envio autonomo de reportes no esta permitido \
+         (ai_policy.autonomous_submission_allowed=false). Deja el hallazgo en borrador y entregalo \
+         al operador humano, o apruebalo con --approve-human {SUBMIT_APPROVAL}.",
+        policy.program
+    ))
+}
+
 pub struct ToolMiddleware {
     db: HiveDb,
     security: Arc<hivecyber_tools::SecurityContext>,
@@ -40,7 +72,12 @@ impl ToolMiddleware {
         // Isolation router: tools declaring Isolation::Sandbox never execute
         // in-process. They are dispatched to the `hivecyber-worker` binary
         // over stdio, where seccomp + rlimits + namespaces confine them.
-        let outcome = if tool.isolation() == Isolation::Sandbox {
+        // Policy gate: autonomous submission to the program's platform is
+        // refused unless the program allows it or the operator approved it.
+        // The refusal is an ordinary failed outcome, so it is still audited.
+        let outcome = if let Some(reason) = submission_gate(&self.security, tool_name) {
+            ToolOutcome { success: false, result: serde_json::Value::Null, error: Some(reason) }
+        } else if tool.isolation() == Isolation::Sandbox {
             dispatch_to_worker(tool_name, &args, timeout_ms, &self.security).await
         } else {
             match tokio::time::timeout(
@@ -379,5 +416,39 @@ mod sandbox_policy_tests {
         assert!(sandbox_refuses(false, false));
         // Non-Linux with explicit opt-in → allowed (unsafe, operator's choice).
         assert!(!sandbox_refuses(false, true));
+    }
+}
+#[cfg(test)]
+mod submission_gate_tests {
+    use super::*;
+    use hivecyber_tools::{EngagementPolicy, SecurityContext};
+
+    fn security(policy: Option<EngagementPolicy>) -> SecurityContext {
+        SecurityContext { engagement_policy: policy.map(Arc::new), ..Default::default() }
+    }
+    fn policy(autonomous: bool) -> EngagementPolicy {
+        let mut p = EngagementPolicy { program: "acme".into(), ..Default::default() };
+        p.ai_policy.autonomous_submission_allowed = autonomous;
+        p
+    }
+
+    #[test]
+    fn blocks_submission_tools_unless_allowed_or_approved() {
+        let s = security(Some(policy(false)));
+        for name in ["bugcrowd_submit_finding", "mcp__bugcrowd__bugcrowd_submit_finding", "Submit_Report"] {
+            let reason = submission_gate(&s, name).expect(name);
+            assert!(reason.contains("acme") && reason.contains("--approve-human submit_report"));
+        }
+        // Borradores y otras tools no se tocan.
+        for name in ["bugcrowd_save_finding_draft", "nmap", "browser_submit_form", "finding_record"] {
+            assert!(submission_gate(&s, name).is_none(), "{name}");
+        }
+        // Aprobacion explicita del operador.
+        s.grant_human_approval(SUBMIT_APPROVAL);
+        assert!(submission_gate(&s, "bugcrowd_submit_finding").is_none());
+        // Programa que permite envio autonomo.
+        assert!(submission_gate(&security(Some(policy(true))), "bugcrowd_submit_finding").is_none());
+        // Sin politica cargada no hay gate (como el resto de gates de politica).
+        assert!(submission_gate(&security(None), "bugcrowd_submit_finding").is_none());
     }
 }

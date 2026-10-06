@@ -128,6 +128,11 @@ impl JobExecutor for WorkerTaskExecutor {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&knowledge_ctx);
         }
+        let ai_ctx = crate::agent::routing_context::build_ai_policy_context(task_security.engagement_policy.as_deref());
+        if !ai_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&ai_ctx);
+        }
         let provider = agent_val.get("provider_id").and_then(|p| p.as_str())
             .unwrap_or(&self.config.models.default_provider);
         // model_id from the agent, else the global config default, else empty —
@@ -146,7 +151,8 @@ impl JobExecutor for WorkerTaskExecutor {
         crate::agent::knowledge_backend::KnowledgeBackend::register(
             &mut tool_registry,
             &self.db,
-            program,
+            &task_security,
+            worker_id,
         );
         // MCP tools are exposed to workers too; the allowlist below still gates
         // which ones this specific worker may call.
@@ -247,6 +253,11 @@ impl JobExecutor for WorkerTaskExecutor {
 
                 if result.success {
                     evidence.push(format!("{}: {}", tool_call.name, result_str));
+                    // Tools may attach a typed evidence item (e.g. the dedup
+                    // gate's finding status); it flows straight to acceptance.
+                    if let Some(item) = result.result.get("evidence_item") {
+                        evidence.push(item.to_string());
+                    }
                 }
 
                 // Cap tool results so a huge MCP response doesn't starve the

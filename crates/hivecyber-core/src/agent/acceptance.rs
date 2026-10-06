@@ -131,6 +131,7 @@ pub fn verify_check_tool(
         "intel_correlation" => Some(v_intel_correlation(&items)),
         "report_complete" => Some(v_report_complete(delivery, &items)),
         "readback" => Some(v_readback(&items)),
+        "findings_cleared" => Some(v_findings_cleared(&items)),
         _ => None,
     }
 }
@@ -166,6 +167,13 @@ pub enum EvidenceItem {
     ReportFile { path: String, #[serde(default)] sections: Vec<String> },
     /// A reproduction count for a PoC.
     Reproduction { count: u32 },
+    /// Status the dedup gate assigned to a recorded finding.
+    FindingStatus { id: String, status: String },
+    /// The writer consulted the program's findings before drafting.
+    FindingsReviewed {
+        #[serde(default)] reportable: u32,
+        #[serde(default)] held_back: u32,
+    },
     Note { text: String },
 }
 
@@ -324,7 +332,34 @@ fn v_report_complete(delivery: &str, items: &[EvidenceItem]) -> bool {
     has_summary && has_findings && wrote_report
 }
 
+/// Dedup gate for reporting: the writer must have consulted the program's
+/// findings (`finding_list`) before drafting. That tool only returns reportable
+/// findings — drafts and possible duplicates are held back for human review —
+/// so a report built from it cannot include them.
+fn v_findings_cleared(items: &[EvidenceItem]) -> bool {
+    items.iter().any(|i| matches!(i, EvidenceItem::FindingsReviewed { .. }))
+}
+
 fn v_readback(items: &[EvidenceItem]) -> bool {
     count_tool_runs(items, &["fs_write", "fs_edit"]) >= 1
         && count_tool_runs(items, &["fs_read", "fs_list", "fs_exists", "fs_glob"]) >= 1
+}
+#[cfg(test)]
+mod findings_gate_tests {
+    use super::*;
+
+    #[test]
+    fn findings_cleared_requires_consulting_finding_list() {
+        // Sin consulta de hallazgos: el informe no pasa el gate.
+        assert_eq!(verify_check_tool("findings_cleared", "", "x", &["fs_write: {}".into()]), Some(false));
+        // finding_list adjunta un item tipado; llega como linea JSON a la evidencia.
+        let ev = vec![r#"{"type":"findings_reviewed","reportable":2,"held_back":1}"#.to_string()];
+        assert_eq!(verify_check_tool("findings_cleared", "", "x", &ev), Some(true));
+        // Tambien con cero hallazgos (se consulto y no habia nada reportable).
+        let ev = vec![r#"{"type":"findings_reviewed","reportable":0,"held_back":0}"#.to_string()];
+        assert_eq!(verify_check_tool("findings_cleared", "", "x", &ev), Some(true));
+        // El estado de un hallazgo registrado es evidencia tipada valida.
+        let items = parse_evidence(&[r#"{"type":"finding_status","id":"f1","status":"possible_duplicate"}"#.to_string()]);
+        assert_eq!(items, vec![EvidenceItem::FindingStatus { id: "f1".into(), status: "possible_duplicate".into() }]);
+    }
 }

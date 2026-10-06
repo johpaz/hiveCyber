@@ -235,7 +235,8 @@ async fn run_loop(
     crate::agent::knowledge_backend::KnowledgeBackend::register(
         &mut tool_registry,
         &db,
-        knowledge_program(&session_security),
+        &session_security,
+        &opts.agent_id,
     );
 
     // Expose the connected MCP servers' tools to this agent. Registered after
@@ -290,6 +291,11 @@ async fn run_loop(
         if !knowledge_ctx.is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&knowledge_ctx);
+        }
+        let ai_ctx = crate::agent::routing_context::build_ai_policy_context(session_security.engagement_policy.as_deref());
+        if !ai_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&ai_ctx);
         }
     }
 

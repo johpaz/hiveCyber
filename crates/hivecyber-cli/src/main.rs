@@ -170,6 +170,13 @@ enum KnowledgeCommands {
         #[arg(long)]
         kind: Option<String>,
     },
+    /// Lista los hallazgos del programa (de --engagement-policy o --program).
+    Findings {
+        #[arg(long)]
+        program: Option<String>,
+    },
+    /// Revision humana: cambia el estado de un hallazgo (ready, rejected, submitted...).
+    FindingSet { id: String, status: String },
     /// Busca en el cerebro.
     Search {
         query: String,
@@ -466,6 +473,7 @@ async fn sync_knowledge_to_db(db: &HiveDb, security: &hivecyber_tools::SecurityC
     if let Some(doc) = security
         .engagement_policy
         .as_ref()
+        .filter(|p| p.knowledge.ingest_scope_on_load)
         .and_then(|p| hivecyber_core::knowledge::scope_doc(p))
     {
         if let Err(e) = hivecyber_core::knowledge::ingest(db, &[doc]).await {
@@ -528,6 +536,40 @@ async fn cmd_knowledge(
                     d.program.as_deref().unwrap_or("-"),
                     d.title
                 );
+            }
+        }
+        KnowledgeCommands::Findings { program } => {
+            let program = program
+                .or_else(|| {
+                    security
+                        .engagement_policy
+                        .as_ref()
+                        .map(|p| p.program.clone())
+                        .filter(|p| !p.is_empty())
+                })
+                .ok_or_else(|| anyhow::anyhow!("indica --program o --engagement-policy con 'program'"))?;
+            let findings = knowledge::finding::list(&db, &program).await?;
+            if findings.is_empty() {
+                println!("Sin hallazgos para '{program}'.");
+            }
+            println!("{:<38} {:<20} {:<8} {:<26} {}", "ID", "STATUS", "SEV", "VULN @ HOST", "ENDPOINT");
+            for f in findings {
+                println!(
+                    "{:<38} {:<20} {:<8} {:<26} {}{}",
+                    f.id,
+                    f.status.as_str(),
+                    f.severity.as_deref().unwrap_or("-"),
+                    format!("{} @ {}", f.vulnerability, f.host),
+                    f.endpoint,
+                    f.duplicate_of.as_deref().map(|d| format!("  (dup de {d})")).unwrap_or_default()
+                );
+            }
+        }
+        KnowledgeCommands::FindingSet { id, status } => {
+            let status = knowledge::finding::FindingStatus::parse(&status)?;
+            match knowledge::finding::set_status(&db, &id, status).await? {
+                Some(f) => println!("{} -> {}", f.id, f.status.as_str()),
+                None => anyhow::bail!("hallazgo '{id}' no encontrado"),
             }
         }
         KnowledgeCommands::Search { query, kind, program, limit } => {

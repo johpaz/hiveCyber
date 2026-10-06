@@ -20,6 +20,7 @@ pub const COL_MEMORY: &str = "memory";
 pub const COL_SETTINGS: &str = "settings";
 pub const COL_MODELS: &str = "models";
 pub const COL_KNOWLEDGE: &str = "knowledge";
+pub const COL_FINDINGS: &str = "findings";
 
 /// Model catalog entry — mirror of Hive's `storage/seed.ts` models array. The
 /// single source of truth for provider, context window and cost. Doc id is

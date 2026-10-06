@@ -7,6 +7,8 @@
 //! que `kind` y `program` son filtros `Eq` y "general + programa" se resuelve
 //! con dos consultas fusionadas.
 
+pub mod finding;
+
 use crate::store::collections::COL_KNOWLEDGE;
 use crate::store::HiveDb;
 use anyhow::{bail, Context, Result};
@@ -283,6 +285,12 @@ pub fn scope_doc(policy: &hivecyber_tools::EngagementPolicy) -> Option<Knowledge
     body.push_str(&format!(
         "\n## Requieren aprobacion humana\n{}\n",
         if approval.is_empty() { "- (ninguna declarada)".to_string() } else { format!("- {}", approval.join("\n- ")) }
+    ));
+    body.push_str(&format!(
+        "\n## Politica de IA\n- declarar uso de IA en los reportes: {}\n- envio autonomo de reportes: {}\n- umbral de duplicados: {:.2}\n",
+        if policy.ai_policy.disclosure_required { "obligatorio" } else { "no exigido" },
+        if policy.ai_policy.autonomous_submission_allowed { "permitido" } else { "NO permitido (un humano debe enviar)" },
+        policy.knowledge.dedup_threshold,
     ));
     if let Some(tw) = &policy.time_windows {
         body.push_str(&format!(
