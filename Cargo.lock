@@ -1231,6 +1231,7 @@ dependencies = [
 [[package]]
 name = "hivedb-core"
 version = "0.5.1"
+source = "git+https://github.com/johpaz/hiveBD?rev=3bc1050#3bc105021f0bd28d682c0591e31b087989240f85"
 dependencies = [
  "bincode",
  "dashmap",
@@ -1248,6 +1249,7 @@ dependencies = [
 [[package]]
 name = "hivedb-index"
 version = "0.5.1"
+source = "git+https://github.com/johpaz/hiveBD?rev=3bc1050#3bc105021f0bd28d682c0591e31b087989240f85"
 dependencies = [
  "bincode",
  "hnsw_rs",
