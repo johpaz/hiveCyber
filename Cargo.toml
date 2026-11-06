@@ -8,6 +8,7 @@ members = [
     "crates/hivecyber-tools",
     "crates/hivecyber-worker",
     "crates/hivecyber-providers",
+    "crates/hivecyber-gateway",
 ]
 
 [workspace.package]

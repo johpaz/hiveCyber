@@ -162,6 +162,11 @@ impl ProviderRegistry {
         }
     }
 
+    /// The base URL configured for a provider (built-in or overridden).
+    pub fn base_url_for(&self, provider_id: &str) -> Option<String> {
+        self.configs.iter().find(|c| c.id == provider_id).map(|c| c.base_url.clone())
+    }
+
     /// The default model id configured for a provider (built-in or overridden).
     pub fn default_model_for(&self, provider_id: &str) -> Option<String> {
         self.configs
