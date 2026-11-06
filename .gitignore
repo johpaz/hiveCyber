@@ -35,3 +35,11 @@ engagements/*/knowledge/
 
 # Engagement de programa vivo: solo local, no commitear
 engagements/chime/
+
+# Panel web (Rune): dependencias y build
+panel/node_modules/
+panel/dist/
+# Datos de sesión del navegador acotado y credenciales locales
+sessions/
+gateway.token
+scoped-browser.jsonl

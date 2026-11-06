@@ -192,6 +192,7 @@ Ver `.env.example` para todas las API keys soportadas.
 - [docs/use-cases.md](docs/use-cases.md) — Casos de uso: pentest, OSINT, forense, DFIR, blue team, CTF, reportes
 - [docs/e2e.md](docs/e2e.md) — E2E contra apps vulnerables locales (Juice Shop/WebGoat/DVWA) con PolicyGate obligatorio
 - [docs/egress.md](docs/egress.md) — Control de egreso de red (firewall nftables default-deny desde la EngagementPolicy)
+- [docs/panel.md](docs/panel.md) — Panel web en Rune + hivecyber-gateway (REST/WS, controles de alcance)
 
 ## Testing
 
