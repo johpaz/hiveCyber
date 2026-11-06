@@ -4,7 +4,7 @@ import type { ModelInfo, ProviderInfo, ProvidersResp } from '../types';
 import { toast, type LiveModels } from '../ui';
 
 const LOCAL_PRESETS: Record<string, { base_url: string; hint: string }> = {
-  hiveagents: { base_url: 'http://127.0.0.1:3000/v1', hint: 'llm-api local de este equipo' },
+  hiveagents: { base_url: 'http://127.0.0.1:3002/v1', hint: 'endpoint de ciberseguridad de este equipo (clave propia)' },
 };
 
 export interface SettingsData { providers: ProvidersResp; models: ModelInfo[]; live: Record<string, string[]> }

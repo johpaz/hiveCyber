@@ -125,8 +125,9 @@ impl ProviderRegistry {
             },
             ProviderConfig {
                 id: "hiveagents".into(),
-                base_url: "https://llm.hiveagents.io/v1".into(),
-                default_model: "hive-max".into(),
+                // Endpoint dedicado de ciberseguridad (llm-api: src/cyber/server.ts), clave propia.
+                base_url: "http://127.0.0.1:3002/v1".into(),
+                default_model: "cybertiel-35b".into(),
                 api_key_env: "HIVEAGENTS_API_KEY".into(),
                 custom: false,
             },

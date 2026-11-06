@@ -405,15 +405,20 @@ async fn server_origin(s: &Shared, id: &str) -> Result<(String, String), (Status
 pub async fn server_status(State(s): State<Shared>, Path(id): Path<String>) -> ApiResult {
     let (origin, _) = server_origin(&s, &id).await?;
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let v: Value = client
-        .get(format!("{origin}/api/status"))
-        .send()
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, e))?
-        .json()
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, e))?;
-    Ok(Json(json!({ "loaded": v["loaded"], "loading": v["loading"], "model": v["model"]["name"].as_str().map(|n| json!(n)).unwrap_or_else(|| v["model"].clone()), "error": v["error"] })))
+    // llm-api expone /api/status. El endpoint de ciberseguridad gestiona la carga bajo demanda
+    // y solo publica /health: en ese caso se informa como "gestionado por el servidor".
+    if let Ok(r) = client.get(format!("{origin}/api/status")).send().await {
+        if r.status().is_success() {
+            if let Ok(v) = r.json::<Value>().await {
+                return Ok(Json(json!({ "loaded": v["loaded"], "loading": v["loading"], "model": v["model"]["name"].as_str().map(|n| json!(n)).unwrap_or_else(|| v["model"].clone()), "error": v["error"] })));
+            }
+        }
+    }
+    match client.get(format!("{origin}/health")).send().await {
+        Ok(r) if r.status().is_success() => Ok(Json(json!({ "loaded": true, "loading": false, "model": "carga bajo demanda (gestionada por el endpoint)", "error": Value::Null }))),
+        Ok(r) => Err(err(StatusCode::BAD_GATEWAY, format!("el servidor respondió {}", r.status()))),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, e)),
+    }
 }
 
 #[derive(Deserialize)]
