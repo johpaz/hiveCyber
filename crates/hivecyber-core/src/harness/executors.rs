@@ -157,7 +157,7 @@ impl JobExecutor for WorkerTaskExecutor {
         // MCP tools are exposed to workers too; the allowlist below still gates
         // which ones this specific worker may call.
         if let Some(mcp) = self.mcp.as_ref() {
-            crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp).await;
+            crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp, task_security.clone()).await;
         }
         let active_tools: Vec<hivecyber_providers::ToolDef> = if tool_allowlist.is_empty() {
             tool_registry.all().iter().map(|t| hivecyber_providers::ToolDef {

@@ -975,7 +975,7 @@ for line in sys.stdin:
     let mut registry = hivecyber_tools::ToolRegistry::create_with_security(Arc::new(
         hivecyber_tools::SecurityContext::default(),
     ));
-    let n = hivecyber_core::agent::mcp_integration::register_mcp_tools(&mut registry, &mcp).await;
+    let n = hivecyber_core::agent::mcp_integration::register_mcp_tools(&mut registry, &mcp, std::sync::Arc::new(hivecyber_tools::SecurityContext::default())).await;
     assert_eq!(n, 1, "one MCP tool should be registered");
 
     // The proxy is in the registry and executes through the server.

@@ -75,7 +75,26 @@ impl ToolMiddleware {
         // Policy gate: autonomous submission to the program's platform is
         // refused unless the program allows it or the operator approved it.
         // The refusal is an ordinary failed outcome, so it is still audited.
-        let outcome = if let Some(reason) = submission_gate(&self.security, tool_name) {
+        //
+        // Human-approval gate (checked first): if the active EngagementPolicy requires
+        // human approval for a category this tool falls under and the operator has not
+        // granted it, do NOT execute. Return a structured, auditable
+        // "blocked_pending_approval" result the gateway/UI can surface.
+        let outcome = if let Some(category) = self.pending_approval(tool_name) {
+            ToolOutcome {
+                success: false,
+                result: serde_json::json!({
+                    "status": "blocked_pending_approval",
+                    "category": category,
+                    "tool": tool_name,
+                    "args": args,
+                }),
+                error: Some(format!(
+                    "blocked_pending_approval: '{}' requires human approval for category '{}'",
+                    tool_name, category
+                )),
+            }
+        } else if let Some(reason) = submission_gate(&self.security, tool_name) {
             ToolOutcome { success: false, result: serde_json::Value::Null, error: Some(reason) }
         } else if tool.isolation() == Isolation::Sandbox {
             dispatch_to_worker(tool_name, &args, timeout_ms, &self.security).await
@@ -130,6 +149,16 @@ impl ToolMiddleware {
             duration_ms: start.elapsed().as_millis() as u64,
             error: outcome.error,
         }
+    }
+
+    /// First approval category (snake_case id) the active policy requires for
+    /// this tool that has not yet been granted by a human, if any.
+    fn pending_approval(&self, tool_name: &str) -> Option<&'static str> {
+        let policy = self.security.engagement_policy.as_ref()?;
+        hivecyber_tools::engagement::approval_categories_for_tool(tool_name)
+            .into_iter()
+            .find(|c| policy.requires_approval(c) && !self.security.has_human_approval(c.as_str()))
+            .map(|c| c.as_str())
     }
 
     async fn audit(
@@ -321,9 +350,10 @@ pub fn extract_target(tool_name: &str, args: &serde_json::Value) -> Option<Strin
         "nmap" | "dig" | "whois" | "theharvester" | "shodan" | "recon_ng" => obj
             .get("target")
             .or_else(|| obj.get("host"))
+            .or_else(|| obj.get("source"))
             .and_then(|v| v.as_str())
             .map(String::from),
-        "web_fetch" | "web_search" | "nikto" | "nuclei" | "sqlmap" | "browser_navigate"
+        "web_fetch" | "web_head" | "web_search" | "nikto" | "nuclei" | "sqlmap" | "browser_navigate"
         | "browser_screenshot" | "browser_click" | "browser_type" | "browser_extract" => obj
             .get("url")
             .or_else(|| obj.get("target"))
@@ -401,6 +431,79 @@ pub fn allow_unsandboxed() -> bool {
 /// tested independently of the host OS.
 pub fn sandbox_refuses(enforced: bool, allow_unsandboxed: bool) -> bool {
     !enforced && !allow_unsandboxed
+}
+
+#[cfg(test)]
+mod approval_gate_tests {
+    use super::*;
+    use hivecyber_tools::engagement::{approval_categories_for_tool, ApprovalCategory, EngagementPolicy};
+    use hivecyber_tools::{SecurityContext, ToolCategory, ToolSchema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Stub standing in for a gated tool; counts real executions.
+    struct Stub(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Stub {
+        fn name(&self) -> &str { "hydra" }
+        fn description(&self) -> &str { "stub" }
+        fn category(&self) -> ToolCategory { ToolCategory::Exploit }
+        fn parameters(&self) -> ToolSchema {
+            ToolSchema { schema_type: "object".into(), properties: Default::default(), required: None }
+        }
+        async fn execute(&self, _p: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"ran": true}))
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_until_human_approves_then_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HiveDb::open(dir.path()).await.unwrap();
+        let policy = EngagementPolicy {
+            require_human_approval: vec![ApprovalCategory::Exploit],
+            ..Default::default()
+        };
+        let security = Arc::new(SecurityContext {
+            engagement_policy: Some(Arc::new(policy)),
+            ..Default::default()
+        });
+        let mw = ToolMiddleware::new(db.clone(), security.clone());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn Tool> = Arc::new(Stub(runs.clone()));
+        let ctx = AuditCtx { worker: "w".into(), run_id: "r".into(), operator_id: "op".into() };
+        let args = serde_json::json!({"target": "example.com"});
+
+        let blocked = mw.execute(tool.clone(), "hydra", args.clone(), 1000, &ctx).await;
+        assert!(!blocked.success);
+        assert_eq!(blocked.result["status"], "blocked_pending_approval");
+        assert_eq!(blocked.result["category"], "exploit");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "tool must NOT execute while pending");
+
+        security.grant_human_approval("exploit");
+        let ok = mw.execute(tool, "hydra", args, 1000, &ctx).await;
+        assert!(ok.success);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Both attempts are in the tamper-evident chain.
+        let (verified, _) = crate::security::audit::verify_chain(&db).await.unwrap();
+        assert!(verified);
+        assert_eq!(db.count(crate::store::collections::COL_AUDIT_LOG).await, 2);
+    }
+
+    #[test]
+    fn credential_tools_need_exploit_and_credential_use() {
+        let cats = approval_categories_for_tool("hydra");
+        assert!(cats.contains(&ApprovalCategory::Exploit));
+        assert!(cats.contains(&ApprovalCategory::CredentialUse));
+        assert!(approval_categories_for_tool("dig").is_empty());
+    }
+
+    #[test]
+    fn category_ids_match_cli_flag_strings() {
+        assert_eq!(ApprovalCategory::CredentialUse.as_str(), "credential_use");
+        assert_eq!(ApprovalCategory::DestructiveTest.as_str(), "destructive_test");
+    }
 }
 
 #[cfg(test)]

@@ -368,7 +368,15 @@ impl crate::registry::Tool for Ffuf {
     }
 }
 
-pub struct ReconNg;
+pub struct ReconNg {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl ReconNg {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self {
+        ReconNg { security }
+    }
+}
 
 #[async_trait]
 impl crate::registry::Tool for ReconNg {
@@ -396,6 +404,12 @@ impl crate::registry::Tool for ReconNg {
         let options = get_str(&p, "options", "");
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(180);
 
+        // recon-ng modules query third parties about `source`: it must be in scope.
+        if let Err(e) = self.security.validate_target(source) {
+            tracing::warn!("recon_ng source rejected: {}", e);
+            return Ok(json!({"error": "security_policy", "message": e, "target": source}));
+        }
+
         // recon-ng is interactive; drive it non-interactively with -m/-o/-x.
         let mut opts = format!("SOURCE={}", source);
         for extra in options.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -404,7 +418,7 @@ impl crate::registry::Tool for ReconNg {
         }
         let cmd = format!("recon-ng -m {} -o {} -x", module, opts);
 
-        base::CliExec::new(Arc::new(crate::registry::SecurityContext::default())).execute(json!({
+        base::CliExec::new(self.security.clone()).execute(json!({
             "command": cmd,
             "timeout_seconds": timeout,
         })).await

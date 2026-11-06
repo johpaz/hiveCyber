@@ -463,7 +463,34 @@ impl Tool for FsDelete {
     }
 }
 
-pub struct WebFetch;
+
+/// HTTP client whose redirects are re-checked against the engagement scope
+/// (a redirect to an out-of-scope host is refused, never followed).
+fn scoped_client(security: &Arc<crate::registry::SecurityContext>, secs: u64) -> Result<reqwest::Client> {
+    let sec = security.clone();
+    let policy = reqwest::redirect::Policy::custom(move |att| {
+        if att.previous().len() >= 5 {
+            return att.error("too many redirects");
+        }
+        match sec.check_web_scope(att.url().as_str(), "GET", false) {
+            Ok(()) => att.follow(),
+            Err(_) => att.stop(),
+        }
+    });
+    Ok(reqwest::Client::builder().timeout(std::time::Duration::from_secs(secs)).redirect(policy).build()?)
+}
+
+fn scope_denied(url: &str, e: String) -> Value {
+    json!({"error": "security_policy", "message": e, "target": url})
+}
+
+pub struct WebFetch {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl WebFetch {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self { WebFetch { security } }
+}
 
 #[async_trait]
 impl Tool for WebFetch {
@@ -473,6 +500,7 @@ impl Tool for WebFetch {
     fn parameters(&self) -> ToolSchema {
         let mut props = HashMap::new();
         props.insert("url".into(), json!({"type": "string"}));
+        props.insert("session".into(), json!({"type": "string", "description": "Perfil de sesión autorizado (cookie guardada por el operador); opcional"}));
         props.insert("format".into(), json!({"type": "string", "default": "text", "enum": ["text", "html"]}));
         ToolSchema {
             schema_type: "object".into(),
@@ -485,11 +513,21 @@ impl Tool for WebFetch {
         let url = p.get("url").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("url required"))?;
         let format = get_str(&p, "format", "text");
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
-
-        let resp = client.get(url).send().await?;
+        if let Err(e) = self.security.admit_web(url, "GET").await {
+            return Ok(scope_denied(url, e));
+        }
+        let client = scoped_client(&self.security, 30)?;
+        let mut req = client.get(url);
+        for (k, v) in self.security.required_headers() {
+            req = req.header(k, v);
+        }
+        if let Some(name) = p.get("session").and_then(|v| v.as_str()) {
+            match self.security.session_cookie(name, url) {
+                Ok(c) => req = req.header(reqwest::header::COOKIE, c),
+                Err(e) => return Ok(scope_denied(url, e)),
+            }
+        }
+        let resp = req.send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         let content_length = text.len();
@@ -515,7 +553,13 @@ impl Tool for WebFetch {
     }
 }
 
-pub struct WebHead;
+pub struct WebHead {
+    security: Arc<crate::registry::SecurityContext>,
+}
+
+impl WebHead {
+    pub fn new(security: Arc<crate::registry::SecurityContext>) -> Self { WebHead { security } }
+}
 
 #[async_trait]
 impl Tool for WebHead {
@@ -527,6 +571,7 @@ impl Tool for WebHead {
     fn parameters(&self) -> ToolSchema {
         let mut props = HashMap::new();
         props.insert("url".into(), json!({"type": "string", "description": "URL absoluta"}));
+        props.insert("session".into(), json!({"type": "string", "description": "Perfil de sesión autorizado (cookie guardada por el operador); opcional"}));
         props.insert("method".into(), json!({
             "type": "string", "default": "head", "enum": ["head", "get"],
             "description": "Usa 'get' si el servidor no soporta HEAD (algunos CDN devuelven 405/501)"
@@ -542,12 +587,22 @@ impl Tool for WebHead {
         let url = p.get("url").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("url required"))?;
         let method = get_str(&p, "method", "head");
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()?;
+        if let Err(e) = self.security.admit_web(url, if method == "get" { "GET" } else { "HEAD" }).await {
+            return Ok(scope_denied(url, e));
+        }
+        let client = scoped_client(&self.security, 20)?;
 
         let started = std::time::Instant::now();
-        let req = if method == "get" { client.get(url) } else { client.head(url) };
+        let mut req = if method == "get" { client.get(url) } else { client.head(url) };
+        for (k, v) in self.security.required_headers() {
+            req = req.header(k, v);
+        }
+        if let Some(name) = p.get("session").and_then(|v| v.as_str()) {
+            match self.security.session_cookie(name, url) {
+                Ok(c) => req = req.header(reqwest::header::COOKIE, c),
+                Err(e) => return Ok(scope_denied(url, e)),
+            }
+        }
         let resp = req.send().await?;
         let elapsed_ms = started.elapsed().as_millis();
 

@@ -21,6 +21,10 @@ pub struct EngagementPolicy {
     /// Parámetros del cerebro (ingesta de scope, umbral de duplicados).
     #[serde(default)]
     pub knowledge: KnowledgeConfig,
+    /// Headers the program requires on every request (e.g. `X-Request-Purpose: Research`).
+    /// Sent by the web tools automatically so compliance never depends on the model.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub required_headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Política de IA del programa. Los valores por defecto son los conservadores:
@@ -98,6 +102,33 @@ pub enum ApprovalCategory {
     DataAccess,
     DestructiveTest,
     CredentialUse,
+}
+
+impl ApprovalCategory {
+    /// Stable snake_case id; the same string `--approve-human` and
+    /// `SecurityContext::grant_human_approval` use.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApprovalCategory::Exploit => "exploit",
+            ApprovalCategory::DataAccess => "data_access",
+            ApprovalCategory::DestructiveTest => "destructive_test",
+            ApprovalCategory::CredentialUse => "credential_use",
+        }
+    }
+}
+
+/// Approval categories a tool call falls under. A call needs every returned
+/// category approved when the active policy lists it in `require_human_approval`.
+pub fn approval_categories_for_tool(tool_name: &str) -> Vec<ApprovalCategory> {
+    match tool_name {
+        "metasploit_rpc" => vec![ApprovalCategory::Exploit],
+        "hydra" | "crackmapexec" | "mimikatz" => {
+            vec![ApprovalCategory::Exploit, ApprovalCategory::CredentialUse]
+        }
+        "sqlmap" => vec![ApprovalCategory::DataAccess],
+        "fs_delete" => vec![ApprovalCategory::DestructiveTest],
+        _ => vec![],
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

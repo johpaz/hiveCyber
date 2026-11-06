@@ -244,7 +244,7 @@ async fn run_loop(
     // a security-gated built-in (native wins). They then flow through the BM25
     // tool-selector below like any other tool.
     if let Some(mcp) = opts.mcp_manager.as_ref() {
-        let n = crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp).await;
+        let n = crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp, opts.security.clone()).await;
         if n > 0 {
             tracing::info!("registered {} MCP tool(s) for agent {}", n, opts.agent_id);
         }
