@@ -48,6 +48,27 @@ pub fn submission_gate(security: &hivecyber_tools::SecurityContext, tool_name: &
     ))
 }
 
+/// Tools that brute-force or mass-probe a target. Refused outright when the active
+/// policy prohibits automated scanning / DoS (e.g. Vinted, Web.com), because these
+/// tools do not enforce the program's required headers or per-host rate limit.
+const AUTOMATED_SCAN_TOOLS: &[&str] = &["ffuf", "feroxbuster", "arjun", "katana", "gau", "nmap", "nuclei", "nikto", "sqlmap", "hydra"];
+
+pub fn automated_scan_gate(security: &hivecyber_tools::SecurityContext, tool_name: &str) -> Option<String> {
+    use hivecyber_tools::engagement::ProhibitedActivity as P;
+    let policy = security.engagement_policy.as_ref()?;
+    if !(policy.is_prohibited(&P::AutomatedScanning) || policy.is_prohibited(&P::DenialOfService)) {
+        return None;
+    }
+    if !AUTOMATED_SCAN_TOOLS.contains(&tool_name.to_lowercase().as_str()) {
+        return None;
+    }
+    Some(format!(
+        "politica del programa '{}': '{}' es escaneo/fuerza bruta automatizada y la politica lo prohibe. \
+         Usa web_fetch/web_head o el navegador acotado, o pide al operador que lo haga manualmente.",
+        policy.program, tool_name
+    ))
+}
+
 pub struct ToolMiddleware {
     db: HiveDb,
     security: Arc<hivecyber_tools::SecurityContext>,
@@ -94,6 +115,8 @@ impl ToolMiddleware {
                     tool_name, category
                 )),
             }
+        } else if let Some(reason) = automated_scan_gate(&self.security, tool_name) {
+            ToolOutcome { success: false, result: serde_json::Value::Null, error: Some(reason) }
         } else if let Some(reason) = submission_gate(&self.security, tool_name) {
             ToolOutcome { success: false, result: serde_json::Value::Null, error: Some(reason) }
         } else if tool.isolation() == Isolation::Sandbox {
@@ -553,5 +576,27 @@ mod submission_gate_tests {
         assert!(submission_gate(&security(Some(policy(true))), "bugcrowd_submit_finding").is_none());
         // Sin politica cargada no hay gate (como el resto de gates de politica).
         assert!(submission_gate(&security(None), "bugcrowd_submit_finding").is_none());
+    }
+}
+
+#[cfg(test)]
+mod automated_scan_gate_tests {
+    use super::*;
+    use hivecyber_tools::engagement::ProhibitedActivity;
+    use hivecyber_tools::{EngagementPolicy, SecurityContext};
+
+    fn sec(prohibit: bool) -> SecurityContext {
+        let mut p = EngagementPolicy { program: "acme".into(), ..Default::default() };
+        if prohibit { p.prohibited = vec![ProhibitedActivity::AutomatedScanning]; }
+        SecurityContext { engagement_policy: Some(Arc::new(p)), ..Default::default() }
+    }
+
+    #[test]
+    fn blocks_bruteforce_tools_only_when_policy_prohibits_scanning() {
+        assert!(automated_scan_gate(&sec(true), "ffuf").is_some());
+        assert!(automated_scan_gate(&sec(true), "feroxbuster").is_some());
+        assert!(automated_scan_gate(&sec(true), "web_fetch").is_none());
+        assert!(automated_scan_gate(&sec(false), "ffuf").is_none());
+        assert!(automated_scan_gate(&SecurityContext::default(), "ffuf").is_none());
     }
 }

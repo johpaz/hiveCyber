@@ -43,3 +43,6 @@ panel/dist/
 sessions/
 gateway.token
 scoped-browser.jsonl
+
+# Bitácoras de sesión de Claude Code (contienen tokens/alias)
+2026-*-*.txt
