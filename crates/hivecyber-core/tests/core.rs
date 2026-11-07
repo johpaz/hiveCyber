@@ -1062,9 +1062,9 @@ async fn test_resolve_context_budget_from_catalog() {
     let db = temp_db().await;
     sync_catalog(&db).await;
 
-    // hiveagents (endpoint de ciberseguridad) CyberTiel (ctx 32768) → budget = 32768 * 0.70 = 22937.
+    // hiveagents (endpoint de ciberseguridad) CyberTiel (ctx 65536) → budget = 65536 * 0.70 = 45875.
     let b = resolve_context_budget(&db, "hiveagents", "cybertiel-35b", 24000).await;
-    assert_eq!(b, 22_937);
+    assert_eq!(b, 45_875);
 
     // Solo quedan modelos del endpoint de ciberseguridad bajo hiveagents.
     let hive: Vec<String> = model_catalog().into_iter().filter(|m| m.provider_id == "hiveagents").map(|m| m.model_id).collect();

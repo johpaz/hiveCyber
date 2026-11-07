@@ -322,8 +322,8 @@ fn parse_models(v: &Value) -> Vec<Value> {
     let arr = v.as_array().cloned().or_else(|| v.get("data").and_then(|d| d.as_array()).cloned()).unwrap_or_default();
     arr.into_iter()
         .filter_map(|m| {
-            let id = m.as_str().map(String::from).or_else(|| m["name"].as_str().or(m["id"].as_str()).map(String::from))?;
-            Some(json!({ "id": id, "size_gb": m["sizeGb"] }))
+            let id = m.as_str().map(String::from).or_else(|| m["id"].as_str().or(m["name"].as_str()).map(String::from))?;
+            Some(json!({ "id": id, "size_gb": m["sizeGb"], "context": m["context_window"], "native_context": m["native_context_window"], "max_output_tokens": m["max_output_tokens"], "installed": m["installed"], "capabilities": m["capabilities"], "roles": m["roles"] }))
         })
         // llm-api also lists audio-model shards (MiniMax-Music3 parts): not chat models.
         .filter(|m| !m["id"].as_str().unwrap_or("").to_lowercase().contains("music"))

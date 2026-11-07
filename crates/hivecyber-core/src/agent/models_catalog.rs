@@ -159,12 +159,13 @@ pub fn model_catalog() -> Vec<ModelDoc> {
         m("mimo-v2.5-pro", "opencode-go", "MiMo-V2.5 Pro", 128000, 0.0, 0.0, &["chat", "code", "function_calling", "streaming", "reasoning"]),
         m("mimo-v2.5", "opencode-go", "MiMo-V2.5", 128000, 0.0, 0.0, &["chat", "code", "function_calling", "streaming"]),
         m("hy3-preview", "opencode-go", "Hunyuan 3 Preview", 128000, 0.0, 0.0, &["chat", "code", "function_calling", "streaming"]),
-        // Endpoint de ciberseguridad (127.0.0.1:3002). Contexto 32768 para todos.
-        m("cybertiel-35b", "hiveagents", "CyberTiel 35B-A3B (pentesting, código, tools)", 32768, 0.0, 0.0, &["chat", "streaming", "reasoning", "function_calling"]),
-        m("uraion-cyber-35b", "hiveagents", "Uraion Cyber Preview 35B-A3B (revisión de código, tools)", 32768, 0.0, 0.0, &["chat", "streaming", "reasoning", "function_calling"]),
-        m("cyberqwen-14b", "hiveagents", "CyberQwen 14B Security (SAST, remediación)", 32768, 0.0, 0.0, &["chat", "streaming"]),
-        m("wolfram-9b", "hiveagents", "Wolfram 9B (forense, IOC, MITRE ATT&CK)", 32768, 0.0, 0.0, &["chat", "streaming"]),
-        m("stagai-26b", "hiveagents", "StagAI CyberSecurity 26B-A4B v2 (análisis de amenazas)", 32768, 0.0, 0.0, &["chat", "streaming"]),
+        // Endpoint de ciberseguridad (127.0.0.1:3002). Contexto efectivo segun GET /v1/models
+        // (CYBER_CONTEXT_SIZE=65536; cyberqwen-14b tiene 32768 nativo). Todos declaran function_calling.
+        m("cybertiel-35b", "hiveagents", "CyberTiel 35B-A3B (pentesting, código, tools)", 65536, 0.0, 0.0, &["chat", "streaming", "reasoning", "function_calling"]),
+        m("uraion-cyber-35b", "hiveagents", "Uraion Cyber Preview 35B-A3B (revisión de código, tools)", 65536, 0.0, 0.0, &["chat", "streaming", "reasoning", "function_calling"]),
+        m("cyberqwen-14b", "hiveagents", "CyberQwen 14B Security (SAST, remediación)", 32768, 0.0, 0.0, &["chat", "streaming", "reasoning", "function_calling"]),
+        m("wolfram-9b", "hiveagents", "Wolfram 9B (forense, IOC, MITRE ATT&CK)", 65536, 0.0, 0.0, &["chat", "streaming", "reasoning", "function_calling"]),
+        m("stagai-26b", "hiveagents", "StagAI CyberSecurity 26B-A4B v2 (análisis de amenazas)", 65536, 0.0, 0.0, &["chat", "streaming", "reasoning", "function_calling"]),
     ]
 }
 

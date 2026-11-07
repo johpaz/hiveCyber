@@ -22,7 +22,7 @@ impl OpenAiCompatProvider {
             client,
             api_key: api_key.to_string(),
             model: model.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.trim_end_matches('/').trim_end_matches("/v1").to_string(),
         }
     }
 }
