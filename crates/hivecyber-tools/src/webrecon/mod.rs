@@ -448,4 +448,65 @@ mod tests {
         // en CI el binario normalmente no existe: debe reportarlo, no fallar.
         assert!(ok["error"] == "binary_not_found" || ok["tool"] == "subfinder", "{ok}");
     }
+
+    /// Ejecución real: un `httpx` falso en PATH registra su argv y emite JSONL.
+    /// Valida spawn, argv sin shell, rps tomado de la política y normalización.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_binary_end_to_end_with_policy_rate_and_jsonl_output() {
+        use crate::engagement::{EngagementPolicy, TargetRule};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("hc-stub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv_log = dir.join("argv.txt");
+        let stub = dir.join("httpx");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n\
+                 echo '{{\"url\":\"https://a.acme.com\",\"status_code\":200}}'\n\
+                 echo '{{\"url\":\"https://b.acme.com\",\"status_code\":403}}'\n\
+                 echo 'no es json'\n",
+                argv_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), old));
+
+        let sec = Arc::new(SecurityContext {
+            unsafe_mode: false,
+            allowlist_hosts: vec![],
+            operator_id: "t".into(),
+            engagement_policy: Some(Arc::new(EngagementPolicy {
+                program: "acme".into(),
+                targets: vec![TargetRule {
+                    host: "*.acme.com".into(),
+                    rate_limit_rps: Some(4.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            human_approvals: Default::default(),
+            allow_cli_exec: false,
+            task_root: None,
+        });
+        let tools = create_all(sec);
+        let httpx = tools.iter().find(|t| t.name() == "httpx").unwrap();
+        let out = httpx.execute(json!({"target": "https://a.acme.com/app"})).await.unwrap();
+
+        assert_eq!(out["tool"], "httpx", "{out}");
+        assert_eq!(out["count"], 3);
+        assert_eq!(out["results"][0]["status_code"], 200, "JSONL parseado");
+        assert_eq!(out["results"][2], "no es json", "línea no JSON se conserva como texto");
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(lines[0], "-u");
+        assert_eq!(lines[1], "https://a.acme.com/app");
+        // el rps de la regla (4) llega como `-rl 4`, no el valor por defecto (2)
+        let pos = lines.iter().position(|l| *l == "-rl").expect("-rl");
+        assert_eq!(lines[pos + 1], "4");
+    }
 }

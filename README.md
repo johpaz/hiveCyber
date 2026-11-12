@@ -25,7 +25,7 @@ configurar → definir alcance → operar → auditar. Empieza aquí.
 | EngagementPolicy (`tools/src/engagement.rs`) | 18 | host matching exacto/subdominio/CIDR v4+v6, exclusiones, glob de paths |
 | Worker sandbox (`hivecyber-worker/src/sandbox.rs`) | 8 | seccomp allowlist funcional (arranca y ejecuta), rlimits, namespaces best-effort |
 | Búsqueda BM25 de capacidades (`agent/capability_search.rs` + tool/catalog selector) | 14 | tantivy, tokenizer ES, tool-selector (máx 12/turno) enganchado al loop, routing_exclusions |
-| **Total** (`cargo test --workspace`) | **279** | todos verdes |
+| **Total** (`cargo test --workspace`) | **280** | todos verdes |
 
 ## Caracteristicas
 
