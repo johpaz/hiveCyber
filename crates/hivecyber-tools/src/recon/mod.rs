@@ -300,17 +300,25 @@ macro_rules! cli_scan {
                 let target = p.get("target").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("target required"))?;
                 let flags = get_str(&p, "flags", "");
                 let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or($timeout);
-                if let Err(e) = safe_flags(&flags) {
-                    return Ok(json!({"error": "bad_flags", "message": e.to_string()}));
-                }
+                // El target y cada flag viajan CITADOS al shell: el scope solo mira el
+                // host (ignora lo que sigue a la primera `/`), así que un path con
+                // `;cmd` se ejecutaría si se interpolara crudo.
+                let flag_toks = match base::safe_flags(&flags) {
+                    Ok(f) => f,
+                    Err(e) => return Ok(json!({"error": "bad_flags", "message": e.to_string()})),
+                };
+                let target_q = match base::safe_value("target", target) {
+                    Ok(t) => base::shq(&t),
+                    Err(e) => return Ok(json!({"error": "bad_target", "message": e.to_string()})),
+                };
                 if let Err(e) = self.security.validate_target(target) {
                     return Ok(json!({"error": "security_policy", "message": e, "target": target}));
                 }
-                let cmd = if flags.is_empty() {
-                    format!("{} {}", $prefix, target)
-                } else {
-                    format!("{} {} {}", $prefix, target, flags)
-                };
+                let mut cmd = format!("{} {}", $prefix, target_q);
+                for t in &flag_toks {
+                    cmd.push(' ');
+                    cmd.push_str(&base::shq(t));
+                }
                 base::CliExec::new(self.security.clone()).execute(json!({
                     "command": cmd,
                     "timeout_seconds": timeout,
@@ -370,16 +378,23 @@ impl crate::registry::Tool for Ffuf {
         if !url.contains("FUZZ") {
             return Ok(json!({"error": "bad_url", "message": "la URL debe contener la palabra FUZZ"}));
         }
-        if let Err(e) = safe_flags(&flags).and_then(|_| safe_flags(wordlist)) {
-            return Ok(json!({"error": "bad_flags", "message": e.to_string()}));
-        }
+        let flag_toks = match base::safe_flags(&flags) {
+            Ok(f) => f,
+            Err(e) => return Ok(json!({"error": "bad_flags", "message": e.to_string()})),
+        };
+        let (url_v, wordlist_v) = match (base::safe_value("url", url), base::safe_value("wordlist", wordlist)) {
+            (Ok(u), Ok(w)) => (u, w),
+            (Err(e), _) | (_, Err(e)) => return Ok(json!({"error": "bad_flags", "message": e.to_string()})),
+        };
         // Validate the host behind the URL (strip the FUZZ placeholder first so
         // it is not mistaken for a path/host token).
         let scope_url = url.replace("FUZZ", "");
         if let Err(e) = self.security.validate_target(&scope_url) {
             return Ok(json!({"error": "security_policy", "message": e, "target": url}));
         }
-        let cmd = format!("ffuf -u {} -w {} {}", url, wordlist, flags);
+        let mut argv: Vec<String> = vec!["-u".into(), url_v, "-w".into(), wordlist_v];
+        argv.extend(flag_toks);
+        let cmd = base::quoted_cmd("ffuf", &argv);
         base::CliExec::new(self.security.clone()).execute(json!({
             "command": cmd,
             "timeout_seconds": timeout,
@@ -481,6 +496,23 @@ mod web_recon_tests {
         let t = Subfinder::new(scoped());
         let out = t.execute(json!({"target": "evil.test"})).await.unwrap();
         assert_eq!(out["error"], "security_policy", "{out}");
+    }
+
+    /// Regresión: el `target` solo pasaba por el scope (que ignora lo que sigue a
+    /// la primera `/`) y se interpolaba sin citar en `bash -c`: un path con `;cmd`
+    /// ejecutaba `cmd`. El comando de prueba solo crea un archivo temporal vacío.
+    #[tokio::test]
+    async fn target_path_cannot_inject_shell_commands() {
+        let flag = std::env::temp_dir().join(format!("hc-inject-{}", uuid::Uuid::new_v4()));
+        for tool in [
+            Box::new(Httpx::new(scoped())) as Box<dyn Tool>,
+            Box::new(Katana::new(scoped())),
+            Box::new(Gau::new(scoped())),
+        ] {
+            let target = format!("https://example.com/x;touch {}", flag.display());
+            let out = tool.execute(json!({"target": target})).await.unwrap();
+            assert!(!flag.exists(), "{}: inyección de comandos ejecutada: {out}", tool.name());
+        }
     }
 
     #[tokio::test]

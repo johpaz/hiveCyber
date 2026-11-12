@@ -63,3 +63,18 @@ Scaffolding validado: el compose es válido, Juice Shop arranca y responde (`200
 `/rest/products/search`), y el path del harness carga la política + pasa el gate
 `--require-policy` + siembra agentes. El paso final (Caelum ejecutando recon real) requiere
 un provider LLM configurado.
+
+## Prueba en vivo sin LLM (`crates/hivecyber-core/tests/live_e2e.rs`)
+
+Ejercita las herramientas **reales** a través del middleware (política, gates, audit) contra
+Juice Shop en `127.0.0.1:3000`, sin necesitar un proveedor de LLM. Está `#[ignore]` por defecto.
+
+```bash
+podman run -d --name hc-juice -p 127.0.0.1:3000:3000 docker.io/bkimminich/juice-shop
+# httpx y katana en PATH (binarios de ProjectDiscovery o shims `podman run --network host …`)
+cargo test -p hivecyber-core --test live_e2e -- --ignored --nocapture
+```
+
+Verifica: recon real (httpx, katana), bloqueo fuera de scope, `automated_scanning`/DoS prohibidos,
+que un `target` con `;cmd` no ejecuta nada, el pipeline de hallazgos (dedup, redacción, scope) y
+el reporte, y que la cadena de audit verifica con todos los intentos registrados.

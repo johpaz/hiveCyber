@@ -901,6 +901,14 @@ impl Tool for CliExec {
             if candidate.is_empty() {
                 continue;
             }
+            // Un entero decimal pequeño es un puerto/contador/profundidad (`-p 80`,
+            // `-d 1`, `-rl 4`), no una IP. Las IPs ofuscadas en decimal (p. ej.
+            // 2130706433) y en hex (0x7f000001) siguen vigiladas abajo.
+            if candidate.chars().all(|c| c.is_ascii_digit())
+                && candidate.parse::<u64>().map(|n| n <= 65535).unwrap_or(false)
+            {
+                continue;
+            }
             if candidate.contains('.')
                 || candidate.parse::<std::net::IpAddr>().is_ok()
                 || crate::engagement::normalize_host(candidate).parse::<std::net::IpAddr>().is_ok()
@@ -1123,5 +1131,33 @@ mod quoting_tests {
         let out = run_fixed(&sec, &cmd, 5).await.unwrap();
         // se imprime literal; el `echo PWNED` interno NO se ejecutó como comando
         assert_eq!(out["stdout"].as_str().unwrap().trim(), evil);
+    }
+}
+
+#[cfg(test)]
+mod numeric_token_tests {
+    use super::*;
+
+    fn exec() -> CliExec {
+        CliExec::new(Arc::new(crate::registry::SecurityContext {
+            unsafe_mode: true,
+            allow_cli_exec: true,
+            engagement_policy: Some(Arc::new(
+                crate::engagement::EngagementPolicy::from_allowlist_hosts(&["example.com".into()]),
+            )),
+            ..Default::default()
+        }))
+    }
+
+    #[tokio::test]
+    async fn small_numeric_args_are_not_mistaken_for_ips_but_obfuscated_ips_still_are() {
+        // puertos / contadores: pasan el escaneo de tokens
+        let ok = exec().execute(json!({"command": "echo -d 1 -p 80 -rl 4 example.com"})).await;
+        assert!(ok.is_ok(), "{ok:?}");
+        // IP decimal ofuscada (127.0.0.1) y hex: siguen rechazadas
+        for bad in ["echo 2130706433", "echo 0x7f000001"] {
+            let r = exec().execute(json!({"command": bad})).await;
+            assert!(r.is_err(), "{bad} debía rechazarse");
+        }
     }
 }
