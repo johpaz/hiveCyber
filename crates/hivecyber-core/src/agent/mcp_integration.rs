@@ -57,7 +57,11 @@ pub async fn load_and_connect(db: &HiveDb) -> SharedMcp {
 /// exposed. Native tools win on name collision (an MCP tool named like a
 /// built-in is skipped) so the harness's own security-gated tools are never
 /// shadowed.
-pub async fn register_mcp_tools(registry: &mut ToolRegistry, mcp: &SharedMcp) -> usize {
+pub async fn register_mcp_tools(
+    registry: &mut ToolRegistry,
+    mcp: &SharedMcp,
+    security: Arc<hivecyber_tools::SecurityContext>,
+) -> usize {
     let discovered: Vec<(String, String, String, Value)> = {
         let mgr = mcp.lock().await;
         mgr.list_tools()
@@ -85,6 +89,7 @@ pub async fn register_mcp_tools(registry: &mut ToolRegistry, mcp: &SharedMcp) ->
             tool_name: name,
             description,
             input_schema: schema,
+            security: security.clone(),
         }));
         added += 1;
     }
@@ -99,6 +104,35 @@ pub struct McpToolProxy {
     tool_name: String,
     description: String,
     input_schema: Value,
+    security: Arc<hivecyber_tools::SecurityContext>,
+}
+
+/// Scope gate for MCP tools. MCP servers (browsers in particular) make network
+/// requests the harness cannot inspect, so under an EngagementPolicy:
+/// - if the program mandates request headers, MCP tools are refused (they cannot
+///   be attached to a browser's traffic);
+/// - any URL-like argument must be in scope (and rate-limited).
+/// Servers that enforce scope/headers/rate themselves on every browser request
+/// (see tools/scoped-browser) are exempt from the blanket header refusal.
+const SCOPE_ENFORCING_SERVERS: &[&str] = &["scoped-browser"];
+
+fn mcp_scope_check(sec: &hivecyber_tools::SecurityContext, server: &str, params: &Value) -> Result<(), String> {
+    let Some(policy) = sec.engagement_policy.as_ref() else { return Ok(()) };
+    if !policy.required_headers.is_empty() && !SCOPE_ENFORCING_SERVERS.contains(&server) {
+        return Err(format!(
+            "MCP tools are disabled under program '{}': it requires request headers ({}) that an MCP browser cannot attach",
+            policy.program,
+            policy.required_headers.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if let Some(obj) = params.as_object() {
+        for key in ["url", "uri", "href", "target", "host"] {
+            if let Some(u) = obj.get(key).and_then(|v| v.as_str()) {
+                sec.check_web_scope(u, "GET", true)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -116,6 +150,9 @@ impl Tool for McpToolProxy {
         schema_from_mcp(&self.input_schema)
     }
     async fn execute(&self, params: Value) -> Result<Value> {
+        if let Err(e) = mcp_scope_check(&self.security, &self.server, &params) {
+            return Ok(serde_json::json!({"error": "security_policy", "message": e}));
+        }
         let mut mgr = self.mcp.lock().await;
         mgr.call_tool(&self.server, &self.tool_name, &params).await
     }
@@ -144,6 +181,22 @@ fn schema_from_mcp(schema: &Value) -> ToolSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_blocked_when_program_requires_headers_and_url_checked() {
+        let mk = |v: serde_json::Value| hivecyber_tools::SecurityContext {
+            engagement_policy: Some(Arc::new(serde_json::from_value(v).unwrap())),
+            ..Default::default()
+        };
+        let with_headers = mk(serde_json::json!({"program":"p","targets":[{"host":"ok.com","methods":["GET"]}],"required_headers":{"X-A":"b"}}));
+        assert!(mcp_scope_check(&with_headers, "obscura", &serde_json::json!({"url":"https://ok.com/"})).is_err());
+        let plain = mk(serde_json::json!({"program":"p","targets":[{"host":"ok.com","methods":["GET"]}]}));
+        assert!(mcp_scope_check(&with_headers, "scoped-browser", &serde_json::json!({"url":"https://ok.com/"})).is_ok());
+        assert!(mcp_scope_check(&with_headers, "scoped-browser", &serde_json::json!({"url":"https://evil.com/"})).is_err());
+        assert!(mcp_scope_check(&plain, "obscura", &serde_json::json!({"url":"https://ok.com/"})).is_ok());
+        assert!(mcp_scope_check(&plain, "obscura", &serde_json::json!({"url":"https://evil.com/"})).is_err());
+        assert!(mcp_scope_check(&hivecyber_tools::SecurityContext::default(), "obscura", &serde_json::json!({"url":"https://evil.com/"})).is_ok());
+    }
 
     #[test]
     fn schema_from_mcp_extracts_properties_and_required() {

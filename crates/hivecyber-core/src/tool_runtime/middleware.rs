@@ -16,6 +16,59 @@ pub struct AuditCtx {
     pub operator_id: String,
 }
 
+/// Tools that submit a report to the program's platform (matched on the name,
+/// so MCP-prefixed names such as `bugcrowd_submit_finding` are covered).
+const SUBMISSION_TOOL_MARKERS: &[&str] =
+    &["submit_finding", "submit_report", "submit_vulnerability", "submit_submission"];
+
+/// Approval category an operator grants (`--approve-human submit_report`) to let
+/// a single run submit despite `ai_policy.autonomous_submission_allowed=false`.
+pub const SUBMIT_APPROVAL: &str = "submit_report";
+
+/// `Some(reason)` when `tool_name` is a submission tool and the active program
+/// forbids autonomous submission and no operator approval is on record. Only
+/// applies when an engagement policy is loaded (like the other policy gates).
+pub fn submission_gate(security: &hivecyber_tools::SecurityContext, tool_name: &str) -> Option<String> {
+    let policy = security.engagement_policy.as_ref()?;
+    if policy.ai_policy.autonomous_submission_allowed {
+        return None;
+    }
+    let name = tool_name.to_lowercase();
+    if !SUBMISSION_TOOL_MARKERS.iter().any(|m| name.contains(m)) {
+        return None;
+    }
+    if security.has_human_approval(SUBMIT_APPROVAL) {
+        return None;
+    }
+    Some(format!(
+        "politica del programa '{}': el envio autonomo de reportes no esta permitido \
+         (ai_policy.autonomous_submission_allowed=false). Deja el hallazgo en borrador y entregalo \
+         al operador humano, o apruebalo con --approve-human {SUBMIT_APPROVAL}.",
+        policy.program
+    ))
+}
+
+/// Tools that brute-force or mass-probe a target. Refused outright when the active
+/// policy prohibits automated scanning / DoS (e.g. Vinted, Web.com), because these
+/// tools do not enforce the program's required headers or per-host rate limit.
+const AUTOMATED_SCAN_TOOLS: &[&str] = &["ffuf", "feroxbuster", "arjun", "katana", "gau", "nmap", "nuclei", "nikto", "sqlmap", "hydra"];
+
+pub fn automated_scan_gate(security: &hivecyber_tools::SecurityContext, tool_name: &str) -> Option<String> {
+    use hivecyber_tools::engagement::ProhibitedActivity as P;
+    let policy = security.engagement_policy.as_ref()?;
+    if !(policy.is_prohibited(&P::AutomatedScanning) || policy.is_prohibited(&P::DenialOfService)) {
+        return None;
+    }
+    if !AUTOMATED_SCAN_TOOLS.contains(&tool_name.to_lowercase().as_str()) {
+        return None;
+    }
+    Some(format!(
+        "politica del programa '{}': '{}' es escaneo/fuerza bruta automatizada y la politica lo prohibe. \
+         Usa web_fetch/web_head o el navegador acotado, o pide al operador que lo haga manualmente.",
+        policy.program, tool_name
+    ))
+}
+
 pub struct ToolMiddleware {
     db: HiveDb,
     security: Arc<hivecyber_tools::SecurityContext>,
@@ -40,7 +93,33 @@ impl ToolMiddleware {
         // Isolation router: tools declaring Isolation::Sandbox never execute
         // in-process. They are dispatched to the `hivecyber-worker` binary
         // over stdio, where seccomp + rlimits + namespaces confine them.
-        let outcome = if tool.isolation() == Isolation::Sandbox {
+        // Policy gate: autonomous submission to the program's platform is
+        // refused unless the program allows it or the operator approved it.
+        // The refusal is an ordinary failed outcome, so it is still audited.
+        //
+        // Human-approval gate (checked first): if the active EngagementPolicy requires
+        // human approval for a category this tool falls under and the operator has not
+        // granted it, do NOT execute. Return a structured, auditable
+        // "blocked_pending_approval" result the gateway/UI can surface.
+        let outcome = if let Some(category) = self.pending_approval(tool_name) {
+            ToolOutcome {
+                success: false,
+                result: serde_json::json!({
+                    "status": "blocked_pending_approval",
+                    "category": category,
+                    "tool": tool_name,
+                    "args": args,
+                }),
+                error: Some(format!(
+                    "blocked_pending_approval: '{}' requires human approval for category '{}'",
+                    tool_name, category
+                )),
+            }
+        } else if let Some(reason) = automated_scan_gate(&self.security, tool_name) {
+            ToolOutcome { success: false, result: serde_json::Value::Null, error: Some(reason) }
+        } else if let Some(reason) = submission_gate(&self.security, tool_name) {
+            ToolOutcome { success: false, result: serde_json::Value::Null, error: Some(reason) }
+        } else if tool.isolation() == Isolation::Sandbox {
             dispatch_to_worker(tool_name, &args, timeout_ms, &self.security).await
         } else {
             match tokio::time::timeout(
@@ -93,6 +172,16 @@ impl ToolMiddleware {
             duration_ms: start.elapsed().as_millis() as u64,
             error: outcome.error,
         }
+    }
+
+    /// First approval category (snake_case id) the active policy requires for
+    /// this tool that has not yet been granted by a human, if any.
+    fn pending_approval(&self, tool_name: &str) -> Option<&'static str> {
+        let policy = self.security.engagement_policy.as_ref()?;
+        hivecyber_tools::engagement::approval_categories_for_tool(tool_name)
+            .into_iter()
+            .find(|c| policy.requires_approval(c) && !self.security.has_human_approval(c.as_str()))
+            .map(|c| c.as_str())
     }
 
     async fn audit(
@@ -284,9 +373,10 @@ pub fn extract_target(tool_name: &str, args: &serde_json::Value) -> Option<Strin
         "nmap" | "dig" | "whois" | "theharvester" | "shodan" | "recon_ng" => obj
             .get("target")
             .or_else(|| obj.get("host"))
+            .or_else(|| obj.get("source"))
             .and_then(|v| v.as_str())
             .map(String::from),
-        "web_fetch" | "web_search" | "nikto" | "nuclei" | "sqlmap" | "browser_navigate"
+        "web_fetch" | "web_head" | "web_search" | "nikto" | "nuclei" | "sqlmap" | "browser_navigate"
         | "browser_screenshot" | "browser_click" | "browser_type" | "browser_extract" => obj
             .get("url")
             .or_else(|| obj.get("target"))
@@ -367,6 +457,79 @@ pub fn sandbox_refuses(enforced: bool, allow_unsandboxed: bool) -> bool {
 }
 
 #[cfg(test)]
+mod approval_gate_tests {
+    use super::*;
+    use hivecyber_tools::engagement::{approval_categories_for_tool, ApprovalCategory, EngagementPolicy};
+    use hivecyber_tools::{SecurityContext, ToolCategory, ToolSchema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Stub standing in for a gated tool; counts real executions.
+    struct Stub(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Stub {
+        fn name(&self) -> &str { "hydra" }
+        fn description(&self) -> &str { "stub" }
+        fn category(&self) -> ToolCategory { ToolCategory::Exploit }
+        fn parameters(&self) -> ToolSchema {
+            ToolSchema { schema_type: "object".into(), properties: Default::default(), required: None }
+        }
+        async fn execute(&self, _p: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"ran": true}))
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_until_human_approves_then_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HiveDb::open(dir.path()).await.unwrap();
+        let policy = EngagementPolicy {
+            require_human_approval: vec![ApprovalCategory::Exploit],
+            ..Default::default()
+        };
+        let security = Arc::new(SecurityContext {
+            engagement_policy: Some(Arc::new(policy)),
+            ..Default::default()
+        });
+        let mw = ToolMiddleware::new(db.clone(), security.clone());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn Tool> = Arc::new(Stub(runs.clone()));
+        let ctx = AuditCtx { worker: "w".into(), run_id: "r".into(), operator_id: "op".into() };
+        let args = serde_json::json!({"target": "example.com"});
+
+        let blocked = mw.execute(tool.clone(), "hydra", args.clone(), 1000, &ctx).await;
+        assert!(!blocked.success);
+        assert_eq!(blocked.result["status"], "blocked_pending_approval");
+        assert_eq!(blocked.result["category"], "exploit");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "tool must NOT execute while pending");
+
+        security.grant_human_approval("exploit");
+        let ok = mw.execute(tool, "hydra", args, 1000, &ctx).await;
+        assert!(ok.success);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Both attempts are in the tamper-evident chain.
+        let (verified, _) = crate::security::audit::verify_chain(&db).await.unwrap();
+        assert!(verified);
+        assert_eq!(db.count(crate::store::collections::COL_AUDIT_LOG).await, 2);
+    }
+
+    #[test]
+    fn credential_tools_need_exploit_and_credential_use() {
+        let cats = approval_categories_for_tool("hydra");
+        assert!(cats.contains(&ApprovalCategory::Exploit));
+        assert!(cats.contains(&ApprovalCategory::CredentialUse));
+        assert!(approval_categories_for_tool("dig").is_empty());
+    }
+
+    #[test]
+    fn category_ids_match_cli_flag_strings() {
+        assert_eq!(ApprovalCategory::CredentialUse.as_str(), "credential_use");
+        assert_eq!(ApprovalCategory::DestructiveTest.as_str(), "destructive_test");
+    }
+}
+
+#[cfg(test)]
 mod sandbox_policy_tests {
     use super::sandbox_refuses;
 
@@ -379,5 +542,61 @@ mod sandbox_policy_tests {
         assert!(sandbox_refuses(false, false));
         // Non-Linux with explicit opt-in → allowed (unsafe, operator's choice).
         assert!(!sandbox_refuses(false, true));
+    }
+}
+#[cfg(test)]
+mod submission_gate_tests {
+    use super::*;
+    use hivecyber_tools::{EngagementPolicy, SecurityContext};
+
+    fn security(policy: Option<EngagementPolicy>) -> SecurityContext {
+        SecurityContext { engagement_policy: policy.map(Arc::new), ..Default::default() }
+    }
+    fn policy(autonomous: bool) -> EngagementPolicy {
+        let mut p = EngagementPolicy { program: "acme".into(), ..Default::default() };
+        p.ai_policy.autonomous_submission_allowed = autonomous;
+        p
+    }
+
+    #[test]
+    fn blocks_submission_tools_unless_allowed_or_approved() {
+        let s = security(Some(policy(false)));
+        for name in ["bugcrowd_submit_finding", "mcp__bugcrowd__bugcrowd_submit_finding", "Submit_Report"] {
+            let reason = submission_gate(&s, name).expect(name);
+            assert!(reason.contains("acme") && reason.contains("--approve-human submit_report"));
+        }
+        // Borradores y otras tools no se tocan.
+        for name in ["bugcrowd_save_finding_draft", "nmap", "browser_submit_form", "finding_record"] {
+            assert!(submission_gate(&s, name).is_none(), "{name}");
+        }
+        // Aprobacion explicita del operador.
+        s.grant_human_approval(SUBMIT_APPROVAL);
+        assert!(submission_gate(&s, "bugcrowd_submit_finding").is_none());
+        // Programa que permite envio autonomo.
+        assert!(submission_gate(&security(Some(policy(true))), "bugcrowd_submit_finding").is_none());
+        // Sin politica cargada no hay gate (como el resto de gates de politica).
+        assert!(submission_gate(&security(None), "bugcrowd_submit_finding").is_none());
+    }
+}
+
+#[cfg(test)]
+mod automated_scan_gate_tests {
+    use super::*;
+    use hivecyber_tools::engagement::ProhibitedActivity;
+    use hivecyber_tools::{EngagementPolicy, SecurityContext};
+
+    fn sec(prohibit: bool) -> SecurityContext {
+        let mut p = EngagementPolicy { program: "acme".into(), ..Default::default() };
+        if prohibit { p.prohibited = vec![ProhibitedActivity::AutomatedScanning]; }
+        SecurityContext { engagement_policy: Some(Arc::new(p)), ..Default::default() }
+    }
+
+    #[test]
+    fn blocks_bruteforce_tools_only_when_policy_prohibits_scanning() {
+        assert!(automated_scan_gate(&sec(true), "ffuf").is_some());
+        assert!(automated_scan_gate(&sec(true), "feroxbuster").is_some());
+        assert!(automated_scan_gate(&sec(true), "web_fetch").is_none());
+        assert!(automated_scan_gate(&sec(false), "ffuf").is_none());
+        assert!(automated_scan_gate(&SecurityContext::default(), "ffuf").is_none());
     }
 }

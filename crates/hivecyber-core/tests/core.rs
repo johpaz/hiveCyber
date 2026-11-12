@@ -975,7 +975,7 @@ for line in sys.stdin:
     let mut registry = hivecyber_tools::ToolRegistry::create_with_security(Arc::new(
         hivecyber_tools::SecurityContext::default(),
     ));
-    let n = hivecyber_core::agent::mcp_integration::register_mcp_tools(&mut registry, &mcp).await;
+    let n = hivecyber_core::agent::mcp_integration::register_mcp_tools(&mut registry, &mcp, std::sync::Arc::new(hivecyber_tools::SecurityContext::default())).await;
     assert_eq!(n, 1, "one MCP tool should be registered");
 
     // The proxy is in the registry and executes through the server.
@@ -1062,9 +1062,14 @@ async fn test_resolve_context_budget_from_catalog() {
     let db = temp_db().await;
     sync_catalog(&db).await;
 
-    // hiveagents Qwen (ctx 50000) → budget = 50000 * 0.70 = 35000.
-    let b = resolve_context_budget(&db, "hiveagents", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", 24000).await;
-    assert_eq!(b, 35_000);
+    // hiveagents (endpoint de ciberseguridad) CyberTiel (ctx 65536) → budget = 65536 * 0.70 = 45875.
+    let b = resolve_context_budget(&db, "hiveagents", "cybertiel-35b", 24000).await;
+    assert_eq!(b, 45_875);
+
+    // Solo quedan modelos del endpoint de ciberseguridad bajo hiveagents.
+    let hive: Vec<String> = model_catalog().into_iter().filter(|m| m.provider_id == "hiveagents").map(|m| m.model_id).collect();
+    assert_eq!(hive.len(), 5);
+    assert!(hive.iter().all(|id| ["cybertiel-35b", "uraion-cyber-35b", "cyberqwen-14b", "wolfram-9b", "stagai-26b"].contains(&id.as_str())));
 
     // A 1M-ctx anthropic model → 700000.
     let b2 = resolve_context_budget(&db, "anthropic", "claude-sonnet-5", 24000).await;

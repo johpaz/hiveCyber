@@ -24,8 +24,11 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             name: "Operador de Reconocimiento".into(),
             description: "Ejecuta reconocimiento activo y OSINT sobre targets autorizados. Incluye nmap, recon-ng, theHarvester, whois, dig, shodan.".into(),
             tool_allowlist: vec![
+                "knowledge_search".into(),
                 "nmap".into(), "recon_ng".into(), "theharvester".into(),
                 "whois".into(), "dig".into(), "shodan".into(),
+                "subfinder".into(), "dnsx".into(), "httpx".into(),
+                "katana".into(), "gau".into(),
                 "web_search".into(), "web_fetch".into(),
             ],
             skills: vec!["recon_workflow".into(), "osint_correlation".into()],
@@ -45,6 +48,8 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             name: "Analista de Vulnerabilidades".into(),
             description: "Detecta y analiza vulnerabilidades con nuclei, nikto, sqlmap, searchsploit, semgrep, trivy.".into(),
             tool_allowlist: vec![
+                "knowledge_search".into(),
+                "finding_record".into(),
                 "nuclei".into(), "nikto".into(), "sqlmap".into(),
                 "searchsploit".into(), "semgrep".into(), "trivy".into(),
                 "fs_read".into(), "fs_glob".into(),
@@ -70,6 +75,8 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             name: "Operador de Explotacion".into(),
             description: "Ejecuta explotacion con metasploit, hydra, crackmapexec, mimikatz. Requiere --unsafe y allowlist de hosts.".into(),
             tool_allowlist: vec![
+                "knowledge_search".into(),
+                "finding_record".into(),
                 "metasploit_rpc".into(), "hydra".into(), "crackmapexec".into(),
                 "mimikatz".into(), "cli_exec".into(),
             ],
@@ -94,6 +101,7 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             name: "Analista Forense".into(),
             description: "Analisis post-incidente con volatility, yara, zeek, osquery, parsers de logs. Cadena de custodia obligatoria.".into(),
             tool_allowlist: vec![
+                "knowledge_search".into(),
                 "volatility".into(), "yara_scan".into(), "zeek_parse".into(),
                 "osquery".into(), "log_parse".into(), "fs_read".into(),
             ],
@@ -114,7 +122,11 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             name: "Pentester Web".into(),
             description: "Pentesting de aplicaciones web con nikto, sqlmap, nuclei, browser automation. Requiere --unsafe.".into(),
             tool_allowlist: vec![
+                "knowledge_search".into(),
+                "finding_record".into(),
                 "nikto".into(), "sqlmap".into(), "nuclei".into(),
+                "httpx".into(), "katana".into(), "ffuf".into(),
+                "feroxbuster".into(), "arjun".into(),
                 "browser_navigate".into(), "browser_screenshot".into(),
                 "browser_click".into(), "browser_type".into(),
                 "browser_extract".into(), "web_fetch".into(), "cli_exec".into(),
@@ -140,6 +152,7 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             name: "Analista de Threat Intel".into(),
             description: "OSINT y correlacion de IoCs con shodan, whois, dig, web rearch.".into(),
             tool_allowlist: vec![
+                "knowledge_search".into(),
                 "web_search".into(), "web_fetch".into(), "shodan".into(),
                 "whois".into(), "dig".into(), "fs_read".into(),
             ],
@@ -160,6 +173,8 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
             name: "Redactor de Informes".into(),
             description: "Genera informes de pentest/forense con exec-summary, findings, remediation.".into(),
             tool_allowlist: vec![
+                "knowledge_search".into(),
+                "finding_list".into(),
                 "fs_read".into(), "fs_write".into(), "fs_edit".into(),
                 "office_read".into(), "office_write".into(),
             ],
@@ -169,6 +184,11 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
                     id: "report_complete".into(),
                     description: "Informe existe, abre sin error, incluye exec-summary + findings + remediation".into(),
                     check_tool: Some("report_complete".into()),
+                },
+                AcceptanceCriterion {
+                    id: "findings_cleared".into(),
+                    description: "Consulto los hallazgos del programa (finding_list) antes de redactar; los borradores y posibles duplicados quedan fuera".into(),
+                    check_tool: Some("findings_cleared".into()),
                 },
             ],
             workspace_scope: serde_json::json!({"kind": "workspace", "read": "**/*", "write": "**/*"}),

@@ -78,6 +78,99 @@ impl SecurityContext {
         Ok(())
     }
 
+    /// Scope check for web tools (no `unsafe_mode` requirement: they only issue
+    /// the HTTP method the policy allows). With an active EngagementPolicy the
+    /// host must match a target rule, not be excluded, be inside the operating
+    /// window, and the method must be allowed by the rule. `rate` also applies
+    /// the per-target rate limit. Without a policy: the allowlist (if any).
+    pub fn check_web_scope(&self, url: &str, method: &str, rate: bool) -> Result<(), String> {
+        if let Some(ref policy) = self.engagement_policy {
+            let outcome = policy.target_allowed(url);
+            if outcome.excluded {
+                return Err(format!("target '{}' excluded by engagement policy", url));
+            }
+            let Some(rule) = outcome.rule else {
+                return Err(format!("target '{}' not in engagement policy allowlist", url));
+            };
+            if !rule.methods.is_empty() && !rule.methods.iter().any(|m| m.eq_ignore_ascii_case(method) || (method.eq_ignore_ascii_case("HEAD") && m.eq_ignore_ascii_case("GET"))) {
+                return Err(format!("method {} not allowed for '{}' by engagement policy", method, url));
+            }
+            if !policy.is_within_window(chrono::Utc::now()) {
+                return Err(format!("fuera de la ventana horaria autorizada del programa '{}'", policy.program));
+            }
+            if rate {
+                if let Some(rps) = rule.rate_limit_rps {
+                    self.check_rate_limit(&policy.program, url, rps)?;
+                }
+            }
+            return Ok(());
+        }
+        if !self.allowlist_hosts.is_empty() && !validate_target_in_allowlist(url, &self.allowlist_hosts) {
+            return Err(format!("target '{}' not in allowlist", url));
+        }
+        Ok(())
+    }
+
+    /// Program-mandated headers for outgoing web requests.
+    pub fn required_headers(&self) -> Vec<(String, String)> {
+        self.engagement_policy
+            .as_ref()
+            .map(|p| p.required_headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// `check_web_scope` that waits (up to ~10 s) for the rate limiter instead of
+    /// failing, so parallel tool calls are paced rather than rejected.
+    pub async fn admit_web(&self, url: &str, method: &str) -> Result<(), String> {
+        let mut tries = 0;
+        loop {
+            match self.check_web_scope(url, method, true) {
+                Err(e) if e.starts_with("rate limit") && tries < 12 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Cookie header for a named session profile, read from
+    /// `$HIVECYBER_HOME/sessions/<name>.json` (`{"hosts":[..],"cookie":".."}`, 0600).
+    /// Never logged. Only returned for hosts listed in the profile AND in scope.
+    pub fn session_cookie(&self, name: &str, url: &str) -> Result<String, String> {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err("invalid session name".into());
+        }
+        self.check_web_scope(url, "GET", false)?;
+        let home = std::env::var("HIVECYBER_HOME").unwrap_or_else(|_| {
+            format!("{}/.hivecyber", std::env::var("HOME").unwrap_or_default())
+        });
+        let path = std::path::Path::new(&home).join("sessions").join(format!("{name}.json"));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .map_err(|_| format!("session '{name}' not found"))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(format!("session file for '{name}' must be chmod 600"));
+            }
+        }
+        let doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).map_err(|_| format!("session '{name}' unreadable"))?,
+        )
+        .map_err(|_| format!("session '{name}' is not valid JSON"))?;
+        let host = crate::engagement::normalize_host(url);
+        let listed = doc["hosts"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|h| h.as_str()).any(|h| crate::engagement::normalize_host(h) == host))
+            .unwrap_or(false);
+        if !listed {
+            return Err(format!("session '{name}' is not authorised for host '{host}'"));
+        }
+        doc["cookie"].as_str().map(String::from).ok_or_else(|| "session has no cookie".into())
+    }
+
     /// Enforce a minimum interval (`1/rps`) between requests to a given
     /// (program, host). Fail-closed: exceeding the rate is rejected rather than
     /// queued, so agents never flood a bug-bounty target. Records the request
@@ -289,8 +382,8 @@ impl ToolRegistry {
             std::sync::Arc::new(base::FsExists::new(sec.clone())),
             std::sync::Arc::new(base::FsList::new(sec.clone())),
             std::sync::Arc::new(base::FsDelete::new(sec.clone())),
-            std::sync::Arc::new(base::WebFetch),
-            std::sync::Arc::new(base::WebHead),
+            std::sync::Arc::new(base::WebFetch::new(sec.clone())),
+            std::sync::Arc::new(base::WebHead::new(sec.clone())),
             std::sync::Arc::new(base::WebSearch),
             std::sync::Arc::new(base::CliExec::new(sec.clone())),
         ];
@@ -304,7 +397,17 @@ impl ToolRegistry {
             std::sync::Arc::new(recon::Whois),
             std::sync::Arc::new(recon::TheHarvester),
             std::sync::Arc::new(recon::Shodan),
-            std::sync::Arc::new(recon::ReconNg),
+            std::sync::Arc::new(recon::ReconNg::new(sec.clone())),
+            // Modern ProjectDiscovery-style asset/web surface discovery.
+            std::sync::Arc::new(recon::Subfinder::new(sec.clone())),
+            std::sync::Arc::new(recon::Dnsx::new(sec.clone())),
+            std::sync::Arc::new(recon::Httpx::new(sec.clone())),
+            std::sync::Arc::new(recon::Katana::new(sec.clone())),
+            std::sync::Arc::new(recon::Gau::new(sec.clone())),
+            // Content/parameter discovery (web_pentester).
+            std::sync::Arc::new(recon::Ffuf::new(sec.clone())),
+            std::sync::Arc::new(recon::Feroxbuster::new(sec.clone())),
+            std::sync::Arc::new(recon::Arjun::new(sec.clone())),
         ];
         for tool in recon_tools {
             reg.register(tool);

@@ -115,6 +115,24 @@ impl JobExecutor for WorkerTaskExecutor {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&skills_ctx);
         }
+        // Metodologia / scope / hallazgos previos del cerebro, acotados al
+        // programa del engagement.
+        let program = crate::agent::loop_runner::knowledge_program(&task_security);
+        let knowledge_ctx = crate::agent::routing_context::build_knowledge_context(
+            &self.db,
+            task_description,
+            program.as_deref(),
+        )
+        .await;
+        if !knowledge_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&knowledge_ctx);
+        }
+        let ai_ctx = crate::agent::routing_context::build_ai_policy_context(task_security.engagement_policy.as_deref());
+        if !ai_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&ai_ctx);
+        }
         let provider = agent_val.get("provider_id").and_then(|p| p.as_str())
             .unwrap_or(&self.config.models.default_provider);
         // model_id from the agent, else the global config default, else empty —
@@ -130,10 +148,16 @@ impl JobExecutor for WorkerTaskExecutor {
             .unwrap_or_default();
 
         let mut tool_registry = hivecyber_tools::ToolRegistry::create_with_security(task_security.clone());
+        crate::agent::knowledge_backend::KnowledgeBackend::register(
+            &mut tool_registry,
+            &self.db,
+            &task_security,
+            worker_id,
+        );
         // MCP tools are exposed to workers too; the allowlist below still gates
         // which ones this specific worker may call.
         if let Some(mcp) = self.mcp.as_ref() {
-            crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp).await;
+            crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp, task_security.clone()).await;
         }
         let active_tools: Vec<hivecyber_providers::ToolDef> = if tool_allowlist.is_empty() {
             tool_registry.all().iter().map(|t| hivecyber_providers::ToolDef {
@@ -229,6 +253,11 @@ impl JobExecutor for WorkerTaskExecutor {
 
                 if result.success {
                     evidence.push(format!("{}: {}", tool_call.name, result_str));
+                    // Tools may attach a typed evidence item (e.g. the dedup
+                    // gate's finding status); it flows straight to acceptance.
+                    if let Some(item) = result.result.get("evidence_item") {
+                        evidence.push(item.to_string());
+                    }
                 }
 
                 // Cap tool results so a huge MCP response doesn't starve the

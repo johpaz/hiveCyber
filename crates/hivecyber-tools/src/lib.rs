@@ -5,6 +5,7 @@ pub mod exploit;
 pub mod forensics;
 pub mod office;
 pub mod delegation;
+pub mod knowledge;
 pub mod memory;
 pub mod registry;
 pub mod engagement;

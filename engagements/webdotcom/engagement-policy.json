@@ -1,0 +1,25 @@
+{
+  "program": "webdotcom (Bugcrowd)",
+  "targets": [
+    { "host": "app.web.com",              "paths": ["/**"], "methods": ["GET"], "rate_limit_rps": 1.0, "only_own_accounts": true },
+    { "host": "www.networksolutions.com", "paths": ["/**"], "methods": ["GET"], "rate_limit_rps": 1.0, "only_own_accounts": true },
+    { "host": "www.bluehost.com",         "paths": ["/**"], "methods": ["GET"], "rate_limit_rps": 1.0, "only_own_accounts": true },
+    { "host": "www.hostgator.com",        "paths": ["/**"], "methods": ["GET"], "rate_limit_rps": 1.0, "only_own_accounts": true }
+  ],
+  "excluded": ["app.gator.com"],
+  "prohibited": [
+    "denial_of_service",
+    "credential_stuffing",
+    "social_engineering",
+    "automated_scanning",
+    "data_access",
+    "destructive_test",
+    "social_media_contact",
+    "physical_testing"
+  ],
+  "require_human_approval": ["exploit", "credential_use", "destructive_test", "data_access"],
+  "required_headers": {
+    "X-Request-Purpose": "Research",
+    "X-Bugcrowd-Ninja": "REEMPLAZA_CON_TU_USUARIO_BUGCROWD"
+  }
+}

@@ -32,3 +32,17 @@ Thumbs.db
 # Cerebro: memoria de hallazgos y scope derivado por engagement (privados)
 engagements/*/findings/
 engagements/*/knowledge/
+
+# Engagement de programa vivo: solo local, no commitear
+engagements/chime/
+
+# Panel web (Rune): dependencias y build
+panel/node_modules/
+panel/dist/
+# Datos de sesión del navegador acotado y credenciales locales
+sessions/
+gateway.token
+scoped-browser.jsonl
+
+# Bitácoras de sesión de Claude Code (contienen tokens/alias)
+2026-*-*.txt

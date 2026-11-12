@@ -232,13 +232,19 @@ async fn run_loop(
         tool_registry.register(Arc::new(hivecyber_tools::memory::MemoryList { db: mem.clone() }));
         tool_registry.register(Arc::new(hivecyber_tools::memory::MemorySearch { db: mem }));
     }
+    crate::agent::knowledge_backend::KnowledgeBackend::register(
+        &mut tool_registry,
+        &db,
+        &session_security,
+        &opts.agent_id,
+    );
 
     // Expose the connected MCP servers' tools to this agent. Registered after
     // the native + delegation tools so a colliding MCP tool name never shadows
     // a security-gated built-in (native wins). They then flow through the BM25
     // tool-selector below like any other tool.
     if let Some(mcp) = opts.mcp_manager.as_ref() {
-        let n = crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp).await;
+        let n = crate::agent::mcp_integration::register_mcp_tools(&mut tool_registry, mcp, opts.security.clone()).await;
         if n > 0 {
             tracing::info!("registered {} MCP tool(s) for agent {}", n, opts.agent_id);
         }
@@ -272,6 +278,24 @@ async fn run_loop(
         if !skills_ctx.is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&skills_ctx);
+        }
+    }
+    {
+        let program = knowledge_program(&session_security);
+        let knowledge_ctx = crate::agent::routing_context::build_knowledge_context(
+            &db,
+            &opts.user_message,
+            program.as_deref(),
+        )
+        .await;
+        if !knowledge_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&knowledge_ctx);
+        }
+        let ai_ctx = crate::agent::routing_context::build_ai_policy_context(session_security.engagement_policy.as_deref());
+        if !ai_ctx.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&ai_ctx);
         }
     }
 
@@ -698,4 +722,14 @@ mod rehydrate_tests {
             _ => panic!("expected text"),
         }
     }
+}
+
+/// Slug del engagement activo (vacío = sin programa). Acota el conocimiento
+/// privado que el agente puede ver.
+pub(crate) fn knowledge_program(security: &hivecyber_tools::SecurityContext) -> Option<String> {
+    security
+        .engagement_policy
+        .as_ref()
+        .map(|p| p.program.trim().to_string())
+        .filter(|p| !p.is_empty())
 }

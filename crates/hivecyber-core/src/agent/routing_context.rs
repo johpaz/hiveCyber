@@ -17,6 +17,7 @@ use crate::agent::skill_selector::{select_skills, SkillDescriptor};
 use crate::store::HiveDb;
 use crate::store::collections::{COL_AGENTS, COL_SKILLS};
 
+const KNOWLEDGE_EXCERPT_CHARS: usize = 700;
 const MAX_RANKED_WORKERS: usize = 5;
 const MAX_MCP_TOOLS_LISTED: usize = 25;
 
@@ -69,6 +70,53 @@ pub async fn build_skill_context(db: &HiveDb, message: &str) -> String {
             ));
         }
     }
+    s
+}
+
+/// Build the "conocimiento relevante" block (playbooks, checklists, scope and
+/// prior findings) for `message`, or empty string when nothing is relevant.
+/// `program` is the active engagement slug (private knowledge of that program
+/// is included on top of the general corpus).
+pub async fn build_knowledge_context(db: &HiveDb, message: &str, program: Option<&str>) -> String {
+    let hits = crate::knowledge::select(db, message, program).await;
+    if hits.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("## Conocimiento relevante (cerebro)\n");
+    s.push_str(
+        "Metodologia y contexto recuperados para esta tarea. Para el detalle completo usa `knowledge_search`.\n\n",
+    );
+    for h in &hits {
+        s.push_str(&format!(
+            "### {} [{}] ({})\n{}\n\n",
+            h.doc.title,
+            h.doc.kind.as_str(),
+            h.doc.id,
+            crate::knowledge::excerpt(&h.doc.body, KNOWLEDGE_EXCERPT_CHARS)
+        ));
+    }
+    s
+}
+
+/// Reglas de IA del programa activo para el prompt, o "" sin programa. Es la
+/// parte "blanda" (instrucciones); el bloqueo real del envio lo hace el
+/// middleware (`tool_runtime::middleware::submission_gate`).
+pub fn build_ai_policy_context(policy: Option<&hivecyber_tools::EngagementPolicy>) -> String {
+    let Some(p) = policy.filter(|p| !p.program.trim().is_empty()) else {
+        return String::new();
+    };
+    let mut s = format!("## Politica de IA del programa {}\n", p.program);
+    if p.ai_policy.disclosure_required {
+        s.push_str("- El programa exige declarar el uso de IA: en cada reporte indica que fue asistido por IA.\n");
+    }
+    if p.ai_policy.autonomous_submission_allowed {
+        s.push_str("- El envio autonomo de reportes esta permitido, siempre con reproduccion verificada.\n");
+    } else {
+        s.push_str(
+            "- NO envies reportes a la plataforma. Registra el hallazgo con `finding_record`, deja el informe en borrador y entregalo al operador humano.\n",
+        );
+    }
+    s.push_str("- Antes de reportar, comprueba duplicados: `finding_record` los detecta; no insistas con un hallazgo marcado como duplicado.\n");
     s
 }
 
@@ -156,4 +204,60 @@ pub async fn build_mcp_tools_context(mcp: &crate::agent::mcp_integration::Shared
         }
     }
     s
+}
+
+#[cfg(test)]
+mod knowledge_context_tests {
+    use super::*;
+    use crate::knowledge::{ingest, KnowledgeDoc, KnowledgeKind};
+
+    fn doc(id: &str, kind: KnowledgeKind, program: Option<&str>, title: &str, body: &str) -> KnowledgeDoc {
+        KnowledgeDoc {
+            id: id.into(), kind, title: title.into(), tags: vec![], refs: vec![],
+            severity_hint: None, program: program.map(String::from), dedup_key: None, body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn builds_block_with_relevant_docs_only_and_scopes_by_program() {
+        let dir = std::env::temp_dir().join(format!("hc_kc_{}", uuid::Uuid::new_v4()));
+        let db = HiveDb::open(&dir).await.unwrap();
+        ingest(&db, &[
+            doc("pb-ssrf", KnowledgeKind::Playbook, None, "SSRF", "metadata cloud 169.254"),
+            doc("scope-acme", KnowledgeKind::Scope, Some("acme"), "Scope acme", "ssrf prohibido en pagos"),
+            doc("scope-otro", KnowledgeKind::Scope, Some("otro"), "Scope otro", "ssrf permitido"),
+        ]).await.unwrap();
+
+        // Sin coincidencias -> vacio (no se inyecta nada).
+        assert_eq!(build_knowledge_context(&db, "receta de cocina", None).await, "");
+
+        let general = build_knowledge_context(&db, "probar ssrf", None).await;
+        assert!(general.starts_with("## Conocimiento relevante"));
+        assert!(general.contains("(pb-ssrf)") && !general.contains("scope-acme"));
+
+        let acme = build_knowledge_context(&db, "probar ssrf", Some("acme")).await;
+        assert!(acme.contains("(pb-ssrf)") && acme.contains("(scope-acme)"));
+        assert!(!acme.contains("scope-otro"), "no debe filtrar el scope de otro programa");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod ai_policy_context_tests {
+    use super::*;
+    use hivecyber_tools::EngagementPolicy;
+
+    #[test]
+    fn ai_policy_block_reflects_the_program_rules() {
+        assert_eq!(build_ai_policy_context(None), "");
+        assert_eq!(build_ai_policy_context(Some(&EngagementPolicy::empty())), "", "sin program no hay bloque");
+
+        let mut p = EngagementPolicy { program: "acme".into(), ..Default::default() };
+        let s = build_ai_policy_context(Some(&p));
+        assert!(s.contains("acme") && s.contains("asistido por IA") && s.contains("NO envies reportes"));
+        p.ai_policy.autonomous_submission_allowed = true;
+        p.ai_policy.disclosure_required = false;
+        let s = build_ai_policy_context(Some(&p));
+        assert!(s.contains("permitido") && !s.contains("asistido por IA") && !s.contains("NO envies"));
+    }
 }

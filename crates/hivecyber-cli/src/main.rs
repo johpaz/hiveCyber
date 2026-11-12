@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use hivecyber_core::{Config, HiveDb};
 use hivecyber_core::agent::{catalog, AgentLoop};
+use hivecyber_core::bootstrap::{backfill_catalog_tools, build_worker_prompt, bundled_skills_dir, ensure_seed_agents, handle_job_completion, init_mcp, install_terminal_hook, run_agent_and_print, sync_skills_to_db};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +70,11 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         action: SkillsCommands,
+    },
+    /// Cerebro: playbooks, checklists, scope y hallazgos recuperables (BM25).
+    Knowledge {
+        #[command(subcommand)]
+        action: KnowledgeCommands,
     },
     Mcp {
         #[command(subcommand)]
@@ -152,6 +158,37 @@ enum SkillsCommands {
     Reload,
     /// Install a skill by copying its SKILL.md into the managed skills dir.
     Add { path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeCommands {
+    /// Ingiere un directorio de documentos .md con frontmatter (por defecto ./knowledge).
+    Ingest { path: Option<PathBuf> },
+    /// Deriva e ingiere el scope del programa desde --engagement-policy.
+    IngestScope,
+    /// Lista los documentos del cerebro.
+    List {
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Lista los hallazgos del programa (de --engagement-policy o --program).
+    Findings {
+        #[arg(long)]
+        program: Option<String>,
+    },
+    /// Revision humana: cambia el estado de un hallazgo (ready, rejected, submitted...).
+    FindingSet { id: String, status: String },
+    /// Busca en el cerebro.
+    Search {
+        query: String,
+        #[arg(long)]
+        kind: Option<String>,
+        /// Programa (engagement) cuyo conocimiento privado se incluye.
+        #[arg(long)]
+        program: Option<String>,
+        #[arg(short = 'k', long, default_value_t = 5)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -259,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Provider { action } => cmd_provider(db.clone(), &config, action).await,
         Commands::Models { provider } => cmd_models(db.clone(), provider).await,
         Commands::Skills { action } => cmd_skills(db.clone(), &config, action).await,
+        Commands::Knowledge { action } => cmd_knowledge(db.clone(), security.clone(), action).await,
         Commands::Mcp { action } => cmd_mcp(db.clone(), action).await,
         Commands::Config { action } => cmd_config(&config, action).await,
         Commands::Logs => cmd_logs(db.clone()).await,
@@ -364,50 +402,150 @@ fn build_security_context(cli: &Cli) -> Arc<hivecyber_tools::SecurityContext> {
     security
 }
 
-/// Load + connect the configured MCP servers (if MCP is enabled). Returns the
-/// shared manager so its tools can be registered for every agent this command
-/// runs. Returns `None` when MCP is disabled so the whole feature is a no-op.
-async fn init_mcp(
-    db: &HiveDb,
-    config: &Config,
-) -> Option<hivecyber_core::agent::mcp_integration::SharedMcp> {
-    if !config.mcp.enabled {
-        return None;
-    }
-    Some(hivecyber_core::agent::mcp_integration::load_and_connect(db).await)
-}
-
-/// Bundled skills dir (relative to the CLI crate in dev; falls back to ./skills).
-fn bundled_skills_dir() -> PathBuf {
+/// Bundled knowledge dir (relative to the CLI crate in dev; falls back to ./knowledge).
+fn bundled_knowledge_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../skills/bundled")
+        .join("../../knowledge")
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("./skills/bundled"))
+        .unwrap_or_else(|_| PathBuf::from("./knowledge"))
 }
 
-/// Sync skills from the filesystem (bundled + managed) into `COL_SKILLS` so the
-/// agent loop's BM25 skill-selector can rank them. Best-effort.
-async fn sync_skills_to_db(db: &HiveDb, config: &Config) {
-    let managed = PathBuf::from(&config.skills.managed_dir);
-    let mut loader = hivecyber_skills::SkillLoader::new(&bundled_skills_dir(), &managed);
-    if loader.load_all().is_err() {
-        return;
+/// Sync the bundled knowledge corpus and, if a named engagement policy is
+/// active, its derived scope document into the brain. Best-effort and
+/// idempotent (upserts), like `sync_skills_to_db`.
+async fn sync_knowledge_to_db(db: &HiveDb, security: &hivecyber_tools::SecurityContext) {
+    let dir = bundled_knowledge_dir();
+    if dir.is_dir() {
+        match hivecyber_core::knowledge::ingest_dir(db, &dir).await {
+            Ok((_, skipped)) => {
+                for s in skipped {
+                    eprintln!("Warning: knowledge omitido: {s}");
+                }
+            }
+            Err(e) => eprintln!("Warning: no se pudo ingerir el conocimiento: {e}"),
+        }
     }
-    for s in loader.list() {
-        let doc = serde_json::json!({
-            "id": s.name,
-            "name": s.name,
-            "description": s.description,
-            "category": s.category,
-            "version": s.version,
-            "tags": s.category,
-        });
-        let _ = db.insert(
-            hivecyber_core::store::collections::COL_SKILLS,
-            &s.name,
-            doc,
-        ).await;
+    if let Some(doc) = security
+        .engagement_policy
+        .as_ref()
+        .filter(|p| p.knowledge.ingest_scope_on_load)
+        .and_then(|p| hivecyber_core::knowledge::scope_doc(p))
+    {
+        if let Err(e) = hivecyber_core::knowledge::ingest(db, &[doc]).await {
+            eprintln!("Warning: no se pudo ingerir el scope: {e}");
+        }
     }
+}
+
+async fn cmd_knowledge(
+    db: Arc<HiveDb>,
+    security: Arc<hivecyber_tools::SecurityContext>,
+    action: KnowledgeCommands,
+) -> anyhow::Result<()> {
+    use hivecyber_core::knowledge::{self, KnowledgeDoc, KnowledgeKind};
+    use hivecyber_core::store::collections::COL_KNOWLEDGE;
+
+    let parse_kind = |k: &Option<String>| -> anyhow::Result<Option<KnowledgeKind>> {
+        k.as_deref()
+            .map(|k| {
+                serde_json::from_value::<KnowledgeKind>(serde_json::json!(k))
+                    .map_err(|_| anyhow::anyhow!("kind invalido '{k}' (playbook|checklist|scope|finding)"))
+            })
+            .transpose()
+    };
+
+    match action {
+        KnowledgeCommands::Ingest { path } => {
+            let dir = path.unwrap_or_else(bundled_knowledge_dir);
+            let (n, skipped) = knowledge::ingest_dir(&db, &dir).await?;
+            for s in &skipped {
+                eprintln!("omitido: {s}");
+            }
+            println!("{n} documento(s) ingeridos desde {}", dir.display());
+        }
+        KnowledgeCommands::IngestScope => {
+            let doc = security
+                .engagement_policy
+                .as_ref()
+                .and_then(|p| knowledge::scope_doc(p))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "se requiere --engagement-policy <file> con un campo 'program' no vacio"
+                    )
+                })?;
+            println!("scope ingerido: {}", doc.id);
+            knowledge::ingest(&db, &[doc]).await?;
+        }
+        KnowledgeCommands::List { kind } => {
+            let kind = parse_kind(&kind)?;
+            println!("{:<26} {:<10} {:<14} {}", "ID", "KIND", "PROGRAM", "TITLE");
+            for (_, v) in db.list(COL_KNOWLEDGE).await {
+                let Ok(d) = serde_json::from_value::<KnowledgeDoc>(v) else { continue };
+                if kind.is_some_and(|k| k != d.kind) {
+                    continue;
+                }
+                println!(
+                    "{:<26} {:<10} {:<14} {}",
+                    d.id,
+                    d.kind.as_str(),
+                    d.program.as_deref().unwrap_or("-"),
+                    d.title
+                );
+            }
+        }
+        KnowledgeCommands::Findings { program } => {
+            let program = program
+                .or_else(|| {
+                    security
+                        .engagement_policy
+                        .as_ref()
+                        .map(|p| p.program.clone())
+                        .filter(|p| !p.is_empty())
+                })
+                .ok_or_else(|| anyhow::anyhow!("indica --program o --engagement-policy con 'program'"))?;
+            let findings = knowledge::finding::list(&db, &program).await?;
+            if findings.is_empty() {
+                println!("Sin hallazgos para '{program}'.");
+            }
+            println!("{:<38} {:<20} {:<8} {:<26} {}", "ID", "STATUS", "SEV", "VULN @ HOST", "ENDPOINT");
+            for f in findings {
+                println!(
+                    "{:<38} {:<20} {:<8} {:<26} {}{}",
+                    f.id,
+                    f.status.as_str(),
+                    f.severity.as_deref().unwrap_or("-"),
+                    format!("{} @ {}", f.vulnerability, f.host),
+                    f.endpoint,
+                    f.duplicate_of.as_deref().map(|d| format!("  (dup de {d})")).unwrap_or_default()
+                );
+            }
+        }
+        KnowledgeCommands::FindingSet { id, status } => {
+            let status = knowledge::finding::FindingStatus::parse(&status)?;
+            match knowledge::finding::set_status(&db, &id, status).await? {
+                Some(f) => println!("{} -> {}", f.id, f.status.as_str()),
+                None => anyhow::bail!("hallazgo '{id}' no encontrado"),
+            }
+        }
+        KnowledgeCommands::Search { query, kind, program, limit } => {
+            let kind = parse_kind(&kind)?;
+            let program = program.or_else(|| {
+                security
+                    .engagement_policy
+                    .as_ref()
+                    .map(|p| p.program.clone())
+                    .filter(|p| !p.is_empty())
+            });
+            let hits = knowledge::search(&db, kind, program.as_deref(), &query, limit).await?;
+            if hits.is_empty() {
+                println!("Sin resultados.");
+            }
+            for h in hits {
+                println!("{:>7.2}  {:<10} {:<22} {}", h.score, h.doc.kind.as_str(), h.doc.id, h.doc.title);
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Arc<hivecyber_tools::SecurityContext>) -> anyhow::Result<()> {
@@ -415,6 +553,7 @@ async fn cmd_chat(db: Arc<HiveDb>, config: &Config, agent_id: &str, security: Ar
 
     ensure_seed_agents(&db, config).await?;
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
 
     let mcp = init_mcp(&db, config).await;
@@ -531,6 +670,7 @@ async fn cmd_run(
 ) -> anyhow::Result<()> {
     ensure_seed_agents(&db, config).await?;
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
 
     let thread_id = uuid::Uuid::new_v4().to_string();
@@ -599,6 +739,7 @@ async fn cmd_daemon(
 
     ensure_seed_agents(&db, config).await?;
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
 
     let mcp = init_mcp(&db, config).await;
@@ -659,37 +800,6 @@ async fn cmd_daemon(
     println!("hivecyber daemon: apagando");
     Ok(())
 }
-
-async fn run_agent_and_print(
-    db: Arc<HiveDb>,
-    config: &Config,
-    opts: hivecyber_core::agent::loop_runner::AgentLoopOptions,
-) -> anyhow::Result<()> {
-    let loop_runner = AgentLoop::new((*db).clone(), config.clone());
-    let mut rx = loop_runner.run(opts).await?;
-
-    while let Some(chunk) = rx.recv().await {
-        use hivecyber_core::agent::loop_runner::StreamChunk;
-        match chunk {
-            StreamChunk::Agent { text } => print!("{}", text),
-            StreamChunk::Reasoning { text } => eprintln!("[reasoning] {}", text),
-            StreamChunk::ToolCall { name, args } => eprintln!("\n[tool] {}({})", name, args),
-            StreamChunk::ToolResult { name, result } => eprintln!("[result] {} -> {}", name, result),
-            StreamChunk::Usage { input_tokens, output_tokens } => {
-                eprintln!("[usage] in={} out={}", input_tokens, output_tokens);
-            }
-            StreamChunk::Done { final_text } => {
-                if !final_text.is_empty() {
-                    println!("\n{}", final_text);
-                }
-            }
-            StreamChunk::Error { message } => eprintln!("[error] {}", message),
-        }
-    }
-
-    Ok(())
-}
-
 async fn count_in_flight_jobs(db: &HiveDb) -> usize {
     let jobs = db.list(hivecyber_core::store::collections::COL_JOBS).await;
     jobs.into_iter()
@@ -699,196 +809,6 @@ async fn count_in_flight_jobs(db: &HiveDb) -> usize {
         })
         .count()
 }
-
-fn install_terminal_hook(
-    db: Arc<HiveDb>,
-    config: Config,
-    security: Arc<hivecyber_tools::SecurityContext>,
-    queue: Arc<hivecyber_core::harness::DurableQueue>,
-    mcp: Option<hivecyber_core::agent::mcp_integration::SharedMcp>,
-) -> Arc<tokio::sync::Mutex<u32>> {
-    let group_manager = Arc::new(
-        hivecyber_core::harness::delegation_groups::DelegationGroupManager::new((*db).clone()),
-    );
-    let processed: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-    let pending_checks: Arc<std::sync::Mutex<u32>> = Arc::new(std::sync::Mutex::new(0));
-    let active = Arc::new(tokio::sync::Mutex::new(0u32));
-
-    let pending_checks_outer = pending_checks.clone();
-    let db_outer = db.clone();
-    let queue_hook = queue.clone();
-    let active_hook = active.clone();
-    queue.register_terminal_hook(Arc::new(move |job_id, result| {
-        *pending_checks_outer.lock().unwrap() += 1;
-        let db = db_outer.clone();
-        let config = config.clone();
-        let security = security.clone();
-        let queue = queue_hook.clone();
-        let group_manager = group_manager.clone();
-        let processed = processed.clone();
-        let pending_checks = pending_checks.clone();
-        let active = active_hook.clone();
-        let mcp = mcp.clone();
-        tokio::spawn(async move {
-            handle_job_completion(
-                db,
-                config,
-                security,
-                queue,
-                group_manager,
-                processed,
-                active,
-                job_id,
-                result,
-                mcp,
-            )
-            .await;
-            let mut pc = pending_checks.lock().unwrap();
-            *pc = pc.saturating_sub(1);
-        });
-    }));
-
-    active
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_job_completion(
-    db: Arc<HiveDb>,
-    config: Config,
-    security: Arc<hivecyber_tools::SecurityContext>,
-    queue: Arc<hivecyber_core::harness::DurableQueue>,
-    group_manager: Arc<hivecyber_core::harness::delegation_groups::DelegationGroupManager>,
-    processed: Arc<tokio::sync::Mutex<HashSet<String>>>,
-    active: Arc<tokio::sync::Mutex<u32>>,
-    job_id: String,
-    result: serde_json::Value,
-    mcp: Option<hivecyber_core::agent::mcp_integration::SharedMcp>,
-) {
-    use hivecyber_core::agent::loop_runner::AgentLoopOptions;
-    use hivecyber_core::store::collections::{COL_DELEGATION_GROUPS, COL_JOBS, COL_TASKS};
-
-    let job = db.get(COL_JOBS, &job_id).await;
-    let task_id = job
-        .as_ref()
-        .and_then(|j| j.get("payload_json"))
-        .and_then(|p| p.get("taskId"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string());
-    let thread_id = job
-        .as_ref()
-        .and_then(|j| j.get("payload_json"))
-        .and_then(|p| p.get("originThreadId"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-
-    let Some(task_id) = task_id else {
-        return;
-    };
-
-    let task = db.get(COL_TASKS, &task_id).await;
-    let Some(turn_id) = task
-        .and_then(|t| {
-            t.get("delegation_group_id")
-                .and_then(|d| d.as_str())
-                .map(|s| s.to_string())
-        })
-    else {
-        return;
-    };
-
-    if group_manager.is_group_complete(&turn_id).await.is_none() {
-        if db.get(COL_DELEGATION_GROUPS, &turn_id).await.is_none() {
-            if let Err(e) = group_manager.create_group(&turn_id, "caelum", &thread_id).await {
-                eprintln!("[sistema] error creando grupo {}: {}", turn_id, e);
-            }
-        }
-        let tasks = db.list(COL_TASKS).await;
-        for (tid, val) in tasks {
-            let grp = val
-                .get("delegation_group_id")
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
-            if grp == turn_id {
-                let _ = group_manager.register_task(&turn_id, &tid).await;
-            }
-        }
-    }
-
-    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("");
-    if status == "completed" || status == "ok" {
-        if let Err(e) = group_manager.record_completion(&turn_id, &task_id).await {
-            eprintln!("[sistema] error registro completado: {}", e);
-        }
-    } else if let Err(e) = group_manager.record_failure(&turn_id, &task_id).await {
-        eprintln!("[sistema] error registro fallo: {}", e);
-    }
-
-    let mut processed_guard = processed.lock().await;
-    if processed_guard.contains(&turn_id) {
-        return;
-    }
-    let complete = group_manager.is_group_complete(&turn_id).await.unwrap_or(false);
-    if !complete {
-        return;
-    }
-    processed_guard.insert(turn_id.clone());
-    drop(processed_guard);
-
-    let deliveries = group_manager.get_group_deliveries(&turn_id).await;
-    let mut msg = String::from(
-        "[Sistema] Los workers delegados completaron sus tareas. Entregas:\n\n",
-    );
-    for (i, (status, delivery)) in deliveries.iter().enumerate() {
-        msg.push_str(&format!("--- Entrega {} (status: {}) ---\n", i + 1, status));
-        if let Some(obj) = delivery.as_object() {
-            if let Some(c) = obj.get("content").and_then(|c| c.as_str()) {
-                msg.push_str(c);
-                msg.push('\n');
-            }
-            if let Some(ev) = obj.get("evidence").and_then(|e| e.as_array()) {
-                for item in ev.iter().take(20) {
-                    if let Some(s) = item.as_str() {
-                        msg.push_str("  [evidencia] ");
-                        msg.push_str(&s.chars().take(600).collect::<String>());
-                        msg.push('\n');
-                    }
-                }
-            }
-        } else {
-            msg.push_str("(sin contenido)\n");
-        }
-    }
-    msg.push_str("\n[Fin de entregas] Responde al operador con un resumen ejecutivo de los hallazgos. Si falta trabajo final (p. ej. compilar un informe), delega a report_writer con task_delegate pasandole el contexto de los hallazgos.");
-
-    eprintln!(
-        "\n[sistema] grupo {} completo — reinyectando entregas a caelum",
-        turn_id
-    );
-
-    *active.lock().await += 1;
-    let active2 = active.clone();
-    let db2 = db.clone();
-    let config2 = config.clone();
-    tokio::spawn(async move {
-        let opts = AgentLoopOptions {
-            agent_id: "caelum".into(),
-            user_message: msg,
-            thread_id,
-            max_iterations: 10,
-            security,
-            queue: Some(queue),
-            mcp_manager: mcp,
-            rehydrate: false,
-        };
-        if let Err(e) = run_agent_and_print(db2, &config2, opts).await {
-            eprintln!("[sistema] error en reinyeccion: {}", e);
-        }
-        let mut a = active2.lock().await;
-        *a = a.saturating_sub(1);
-    });
-}
-
 async fn cmd_agent(db: Arc<HiveDb>, action: AgentCommands) -> anyhow::Result<()> {
     match action {
         AgentCommands::List => {
@@ -1446,6 +1366,7 @@ async fn cmd_resume(db: Arc<HiveDb>, config: &Config, run_id: &str, security: Ar
     println!("Resuming run {} (agent={}, thread={})", run_id, agent_id, thread_id);
 
     sync_skills_to_db(&db, config).await;
+    sync_knowledge_to_db(&db, &security).await;
     hivecyber_core::agent::models_catalog::sync_catalog(&db).await;
     let mcp = init_mcp(&db, config).await;
     let loop_runner = AgentLoop::new((*db).clone(), config.clone());
@@ -1669,101 +1590,39 @@ async fn cmd_audit(db: Arc<HiveDb>, action: AuditCommands) -> anyhow::Result<()>
     }
     Ok(())
 }
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use hivecyber_core::store::collections::COL_AGENTS;
 
-async fn ensure_seed_agents(db: &HiveDb, config: &Config) -> anyhow::Result<()> {
-    let count = db.count(hivecyber_core::store::collections::COL_AGENTS).await;
-    if count > 0 {
-        return Ok(());
-    }
+    #[tokio::test]
+    async fn backfill_adds_missing_catalog_tools_preserving_user_agents() {
+        let dir = std::env::temp_dir().join(format!("hc_bf_{}", uuid::Uuid::new_v4()));
+        let db = HiveDb::open(&dir).await.unwrap();
+        // Agente de catalogo sembrado antes (allowlist incompleta).
+        db.insert(COL_AGENTS, "recon_operator", serde_json::json!({
+            "id": "recon_operator", "source": "catalog", "tool_allowlist_json": ["nmap"]
+        })).await.unwrap();
+        // Agente del usuario con el mismo id de persona: intacto.
+        db.insert(COL_AGENTS, "web_pentester", serde_json::json!({
+            "id": "web_pentester", "source": "user", "tool_allowlist_json": ["nikto"]
+        })).await.unwrap();
 
-    tracing::info!("seeding agents...");
+        backfill_catalog_tools(&db).await;
+        backfill_catalog_tools(&db).await; // idempotente
 
-    let coordinator = hivecyber_core::store::collections::AgentDoc {
-        id: "caelum".into(),
-        name: "Caelum".into(),
-        description: "Coordinador de operaciones de ciberseguridad".into(),
-        system_prompt: Some(catalog::COORDINATOR_SYSTEM_PROMPT.into()),
-        tone: None,
-        role: "coordinator".into(),
-        status: "active".into(),
-        enabled: true,
-        provider_id: None,
-        model_id: None,
-        tools_json: Some(vec!["task_delegate".into(), "task_revise".into(), "task_status".into()]),
-        skills_json: None,
-        tool_allowlist_json: None,
-        mcp_server_ids_json: None,
-        workspace_scope_json: None,
-        model_override_json: None,
-        default_acceptance_json: None,
-        helpful_count: 0,
-        harmful_count: 0,
-        parent_id: None,
-        max_iterations: Some(20),
-        workspace: None,
-        source: Some("user".into()),
-        routing_examples_json: None,
-        routing_exclusions_json: None,
-        seed_version: Some(env!("CARGO_PKG_VERSION").into()),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    };
-
-    db.insert(
-        hivecyber_core::store::collections::COL_AGENTS,
-        "caelum",
-        serde_json::to_value(&coordinator)?,
-    ).await?;
-
-    for persona in catalog::catalog_personas() {
-        let now = chrono::Utc::now().to_rfc3339();
-        let agent = hivecyber_core::store::collections::AgentDoc {
-            id: persona.id.clone(),
-            name: persona.name.clone(),
-            description: persona.description.clone(),
-            system_prompt: Some(build_worker_prompt(&persona.id, &persona.description)),
-            tone: Some("professional".into()),
-            role: "worker".into(),
-            status: "idle".into(),
-            enabled: true,
-            provider_id: None,
-            model_id: None,
-            tools_json: None,
-            skills_json: Some(persona.skills.clone()),
-            tool_allowlist_json: Some(persona.tool_allowlist.clone()),
-            mcp_server_ids_json: None,
-            workspace_scope_json: Some(persona.workspace_scope.clone()),
-            model_override_json: persona.model_override.clone(),
-            default_acceptance_json: Some(persona.default_acceptance.clone()),
-            helpful_count: 0,
-            harmful_count: 0,
-            parent_id: Some("caelum".into()),
-            max_iterations: Some(20),
-            workspace: None,
-            source: Some("catalog".into()),
-            routing_examples_json: None,
-            routing_exclusions_json: persona.routing_exclusions.clone(),
-            seed_version: Some(env!("CARGO_PKG_VERSION").into()),
-            created_at: now.clone(),
-            updated_at: now,
+        let list = |v: serde_json::Value| -> Vec<String> {
+            v["tool_allowlist_json"].as_array().unwrap().iter()
+                .map(|t| t.as_str().unwrap().to_string()).collect()
         };
-
-        db.insert(
-            hivecyber_core::store::collections::COL_AGENTS,
-            &persona.id,
-            serde_json::to_value(&agent)?,
-        ).await?;
+        let recon = list(db.get(COL_AGENTS, "recon_operator").await.unwrap());
+        assert_eq!(recon.iter().filter(|t| *t == "nmap").count(), 1, "no duplica lo existente");
+        assert!(recon.contains(&"knowledge_search".to_string()));
+        for added in ["subfinder", "httpx", "katana", "gau"] {
+            assert!(recon.contains(&added.to_string()), "falta {added}: {recon:?}");
+        }
+        // El agente del usuario no se toca.
+        assert_eq!(list(db.get(COL_AGENTS, "web_pentester").await.unwrap()), ["nikto"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
-
-    tracing::info!("seeded 1 coordinator + 8 workers");
-    println!("Agents seeded: 1 coordinator (caelum) + 8 workers");
-
-    Ok(())
-}
-
-fn build_worker_prompt(id: &str, desc: &str) -> String {
-    format!(
-        "# HIVECYBER Worker: {}\n\n{}\n\n## Reglas\n- No hablas con el operador.\n- No delegas.\n- No usas tools fuera de tu allowlist.\n- Declaras exito solo con evidencia verificable.\n- Output estructurado: status, what_was_done, artifacts, evidence, risks, question.",
-        id, desc
-    )
 }

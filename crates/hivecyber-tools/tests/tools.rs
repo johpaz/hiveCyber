@@ -683,3 +683,76 @@ async fn test_fs_absolute_paths_ignore_task_root() {
     let _ = tokio::fs::remove_file(&target).await;
     tokio::fs::remove_dir_all(&root).await.ok();
 }
+
+mod web_scope {
+    use hivecyber_tools::{EngagementPolicy, SecurityContext};
+    use std::sync::Arc;
+
+    fn ctx() -> SecurityContext {
+        let policy: EngagementPolicy = serde_json::from_value(serde_json::json!({
+            "program": "t",
+            "targets": [{"host": "ok.example.com", "paths": ["/**"], "methods": ["GET"], "rate_limit_rps": 1000.0}],
+            "excluded": ["admin.ok.example.com"]
+        })).unwrap();
+        SecurityContext { engagement_policy: Some(Arc::new(policy)), ..Default::default() }
+    }
+
+    #[test]
+    fn web_scope_enforced() {
+        let c = ctx();
+        assert!(c.check_web_scope("https://ok.example.com/a", "GET", false).is_ok());
+        assert!(c.check_web_scope("https://ok.example.com/a", "HEAD", false).is_ok());
+        assert!(c.check_web_scope("https://ok.example.com/a", "POST", false).is_err());
+        assert!(c.check_web_scope("https://evil.com/", "GET", false).is_err());
+        assert!(c.check_web_scope("https://evil-ok.example.com/", "GET", false).is_err());
+        assert!(c.check_web_scope("https://admin.ok.example.com/", "GET", false).is_err());
+    }
+
+    #[test]
+    fn session_cookie_requires_listed_host_and_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        let f = dir.path().join("sessions/lab.json");
+        std::fs::write(&f, r#"{"hosts":["ok.example.com"],"cookie":"s=1"}"#).unwrap();
+        std::env::set_var("HIVECYBER_HOME", dir.path());
+        let c = ctx();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(c.session_cookie("lab", "https://ok.example.com/").unwrap_err().contains("chmod 600"));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(c.session_cookie("lab", "https://ok.example.com/").unwrap(), "s=1");
+        assert!(c.session_cookie("lab", "https://evil.com/").is_err());
+        assert!(c.session_cookie("../x", "https://ok.example.com/").is_err());
+    }
+}
+
+mod required_headers {
+    use hivecyber_tools::registry::Tool;
+    use hivecyber_tools::{EngagementPolicy, SecurityContext};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn web_fetch_sends_program_headers() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_lowercase()
+        });
+        let policy: EngagementPolicy = serde_json::from_value(serde_json::json!({
+            "program": "t",
+            "targets": [{"host": "127.0.0.1", "paths": ["/**"], "methods": ["GET"]}],
+            "required_headers": {"X-Request-Purpose": "Research"}
+        })).unwrap();
+        let sec = Arc::new(SecurityContext { engagement_policy: Some(Arc::new(policy)), ..Default::default() });
+        let tool = hivecyber_tools::base::WebFetch::new(sec);
+        let out = tool.execute(serde_json::json!({"url": format!("http://127.0.0.1:{port}/")})).await.unwrap();
+        assert_eq!(out["status"], 200);
+        let req = srv.await.unwrap();
+        assert!(req.contains("x-request-purpose: research"), "request was: {req}");
+    }
+}

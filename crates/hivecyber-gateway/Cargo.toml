@@ -1,0 +1,30 @@
+[package]
+name = "hivecyber-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "hivecyber-gateway"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+rand = "0.8"
+reqwest = { workspace = true }
+hivecyber-core = { path = "../hivecyber-core" }
+hivecyber-tools = { path = "../hivecyber-tools" }
+hivecyber-providers = { path = "../hivecyber-providers" }

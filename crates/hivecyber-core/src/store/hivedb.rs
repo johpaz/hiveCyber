@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use hivedb_core::{HiveDB, PutOptions, ScanOptions};
+use hivedb_core::{Hit, HiveDB, HybridQuery, IndexDoc, PutOptions, ScanOptions};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -194,6 +194,24 @@ impl HiveDb {
                 0
             }
         }
+    }
+
+    /// Insert or replace documents in the hybrid (BM25/ANN) index under a
+    /// single commit. The index is derived data: callers keep the authoritative
+    /// document in a collection and re-index from it.
+    pub async fn index_upsert_batch(&self, docs: Vec<IndexDoc>) -> Result<()> {
+        self.run(move |db| db.upsert_batch(&docs)).await
+    }
+
+    /// Remove a document from the hybrid index (missing ids are a no-op).
+    pub async fn index_delete(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.run(move |db| db.delete_doc(&id)).await
+    }
+
+    /// Run a hybrid query (BM25 text, optional vector, scalar filters).
+    pub async fn index_search(&self, query: HybridQuery) -> Result<Vec<Hit>> {
+        self.run(move |db| db.query_hybrid(query)).await
     }
 
     /// Create an equality index on a top-level field (optionally unique).
