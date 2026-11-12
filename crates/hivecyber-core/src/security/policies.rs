@@ -80,10 +80,9 @@ pub fn validate_target_in_allowlist(target: &str, allowlist: &[String]) -> bool 
                     }
                 }
             }
-        } else if entry == target
-            || target.ends_with(entry)
-            || target == entry
-        {
+        } else if target == entry || target.ends_with(&format!(".{}", entry)) {
+            // Exact host or a true subdomain (dot boundary): `evilacme.com`
+            // must NOT match `acme.com`.
             return true;
         }
     }

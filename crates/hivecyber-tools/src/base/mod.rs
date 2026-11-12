@@ -485,8 +485,26 @@ impl Tool for WebFetch {
         let url = p.get("url").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("url required"))?;
         let format = get_str(&p, "format", "text");
 
+        // Redirects only within the originally requested host: a 30x to another
+        // host would escape the scope validated by the policy gate.
+        let origin_host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()));
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            let same_host = attempt
+                .url()
+                .host_str()
+                .map(|h| Some(h.to_lowercase()) == origin_host)
+                .unwrap_or(false);
+            if attempt.previous().len() >= 5 || !same_host {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        });
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(redirect_policy)
             .build()?;
 
         let resp = client.get(url).send().await?;
@@ -861,42 +879,7 @@ impl Tool for CliExec {
             }
         }
 
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c").arg(command);
-        cmd.current_dir(&cwd);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let child = cmd.spawn()?;
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await
-        .map_err(|_| anyhow!("command timed out after {}s", timeout_secs))??;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let code = output.status.code().unwrap_or(-1);
-
-        let truncated_out = if stdout.len() > 50_000 {
-            format!("{}...(truncated)", &stdout[..50_000])
-        } else {
-            stdout
-        };
-
-        let truncated_err = if stderr.len() > 20_000 {
-            format!("{}...(truncated)", &stderr[..20_000])
-        } else {
-            stderr
-        };
-
-        Ok(json!({
-            "command": command,
-            "exit_code": code,
-            "stdout": truncated_out,
-            "stderr": truncated_err,
-        }))
+        run_bash(command, &cwd, timeout_secs).await
     }
 }
 #[cfg(test)]
@@ -950,5 +933,158 @@ mod tests {
         );
         assert_eq!(decode_ddg_redirect("//example.com/path"), "https://example.com/path");
         assert_eq!(decode_ddg_redirect("https://direct.com"), "https://direct.com");
+    }
+}
+
+// ───────────── ejecución y citado seguro de comandos fijos ─────────────
+
+/// Cita un valor para bash (`'…'`, con `'` escapado): inerte ante `;|&$()` etc.
+pub fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Valor posicional de un wrapper (host, ruta, dominio…): sin control/NUL/
+/// saltos de línea y sin `-` inicial (no puede colarse como flag).
+pub fn safe_value(label: &str, v: &str) -> Result<String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Err(anyhow!("{} vacío", label));
+    }
+    if v.starts_with('-') {
+        return Err(anyhow!("{} no puede empezar por '-'", label));
+    }
+    if v.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("{} contiene caracteres de control", label));
+    }
+    Ok(v.to_string())
+}
+
+/// Identificador (módulo, protocolo, servicio): `[A-Za-z0-9_./:@-]`, sin `-` inicial.
+pub fn safe_ident(label: &str, v: &str) -> Result<String> {
+    let v = safe_value(label, v)?;
+    if !v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '@' | '-')) {
+        return Err(anyhow!("{} contiene caracteres no permitidos", label));
+    }
+    Ok(v)
+}
+
+/// Divide un string de flags en tokens y exige que cada uno use solo
+/// `[A-Za-z0-9_./:=,@%+-]` (nada de metacaracteres de shell, comillas ni `$`).
+pub fn safe_flags(flags: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for t in flags.split_whitespace() {
+        if !t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '=' | ',' | '@' | '%' | '+' | '-' | '*')) {
+            return Err(anyhow!("flag no permitido '{}' (caracteres de shell)", t));
+        }
+        out.push(t.to_string());
+    }
+    Ok(out)
+}
+
+/// Rechaza flags peligrosos de la herramienta (`--flag` o `--flag=valor`).
+pub fn deny_flags(tool: &str, flags: &[String], denied: &[&str]) -> Result<()> {
+    for f in flags {
+        let name = f.split('=').next().unwrap_or(f);
+        if denied.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+            return Err(anyhow!("flag '{}' no permitido en {}", name, tool));
+        }
+    }
+    Ok(())
+}
+
+/// `bin` (constante de confianza) + argumentos citados.
+pub fn quoted_cmd(bin: &str, args: &[String]) -> String {
+    let mut c = bin.to_string();
+    for a in args {
+        c.push(' ');
+        c.push_str(&shq(a));
+    }
+    c
+}
+
+fn cap_str(s: String, max: usize, tail: &str) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &s[..cut], tail)
+}
+
+/// Ejecuta un comando bash YA validado/citado (sin pasar por los gates de
+/// `cli_exec`). Solo para wrappers de binario fijo cuyos valores van citados.
+pub(crate) async fn run_bash(command: &str, cwd: &str, timeout_secs: u64) -> Result<Value> {
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c").arg(command);
+    cmd.current_dir(cwd);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let child = cmd.spawn()?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| anyhow!("command timed out after {}s", timeout_secs))??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    Ok(json!({
+        "command": command,
+        "exit_code": output.status.code().unwrap_or(-1),
+        "stdout": cap_str(stdout, 50_000, "...(truncated)"),
+        "stderr": cap_str(stderr, 20_000, "...(truncated)"),
+    }))
+}
+
+/// Wrapper de binario fijo: ejecuta en el cwd de la tarea (si hay) o en `.`.
+pub(crate) async fn run_fixed(
+    security: &crate::registry::SecurityContext,
+    command: &str,
+    timeout_secs: u64,
+) -> Result<Value> {
+    let cwd = security
+        .task_root
+        .as_ref()
+        .map(|r| r.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    run_bash(command, &cwd, timeout_secs).await
+}
+
+#[cfg(test)]
+mod quoting_tests {
+    use super::*;
+
+    #[test]
+    fn shq_neutralizes_shell_metacharacters() {
+        assert_eq!(shq("a b"), "'a b'");
+        assert_eq!(shq("x'; rm -rf /; '"), "'x'\\''; rm -rf /; '\\'''");
+    }
+
+    #[test]
+    fn safe_value_and_flags_reject_injection() {
+        assert!(safe_value("t", "-oN").is_err());
+        assert!(safe_value("t", "a\nb").is_err());
+        assert!(safe_value("t", "example.com").is_ok());
+        assert!(safe_flags("-sV -T4 -p80,443").is_ok());
+        assert!(safe_flags("-sV; id").is_err());
+        assert!(safe_flags("$(id)").is_err());
+        assert!(safe_flags("-sV `id`").is_err());
+        assert!(deny_flags("sqlmap", &["--os-shell".into()], &["--os-shell"]).is_err());
+        assert!(deny_flags("sqlmap", &["--file-read=/etc/passwd".into()], &["--file-read"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn quoted_values_reach_the_program_as_literal_text() {
+        let sec = crate::registry::SecurityContext::default();
+        let evil = "a; echo PWNED #";
+        let cmd = quoted_cmd("echo", &[evil.to_string()]);
+        let out = run_fixed(&sec, &cmd, 5).await.unwrap();
+        // se imprime literal; el `echo PWNED` interno NO se ejecutó como comando
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), evil);
     }
 }

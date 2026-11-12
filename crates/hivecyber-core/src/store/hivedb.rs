@@ -42,6 +42,7 @@ fn decode_id(name: &str) -> String {
 #[derive(Clone)]
 pub struct HiveDb {
     engine: Arc<HiveDB>,
+    base_dir: PathBuf,
 }
 
 impl HiveDb {
@@ -57,10 +58,20 @@ impl HiveDb {
             .context("open hivedb engine")?;
         let db = HiveDb {
             engine: Arc::new(engine),
+            base_dir: base_dir.to_path_buf(),
         };
 
         db.import_legacy(base_dir).await?;
         Ok(db)
+    }
+
+    /// Directorio de estado compartido entre procesos ligado A ESTA BD
+    /// (`<base_dir>/state`): locks y cabeceras que solo tienen sentido junto a
+    /// los datos que protegen. `None` si no se puede crear.
+    pub fn shared_state_dir(&self) -> Option<PathBuf> {
+        let d = self.base_dir.join("state");
+        std::fs::create_dir_all(&d).ok()?;
+        Some(d)
     }
 
     /// Direct access to the engine for features beyond the document facade

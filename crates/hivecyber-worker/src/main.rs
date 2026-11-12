@@ -60,6 +60,9 @@ struct WorkerResponse {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    // Marca el proceso como worker: el estado compartido entre procesos
+    // (rate limit por archivo) lo aplica el orquestador, no el sandbox.
+    std::env::set_var("HIVECYBER_IN_WORKER", "1");
     tracing::info!("hivecyber-worker starting (sandboxed)");
 
     // Sandboxing must run before any other OS thread exists: unshare(CLONE_NEWUSER)

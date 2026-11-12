@@ -47,16 +47,15 @@ impl Tool for Volatility {
         let plugin = get_str(&p, "plugin", "windows.info");
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(300);
 
-        let hash = compute_file_hash(dump).await?;
+        let (dump, plugin) = match (base::safe_value("dump", dump), base::safe_ident("plugin", &plugin)) {
+            (Ok(d), Ok(pl)) => (d, pl),
+            (Err(e), _) | (_, Err(e)) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let hash = compute_file_hash(&dump).await?;
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let cmd = format!("vol -f {} {}", dump, plugin);
+        let cmd = base::quoted_cmd("vol", &["-f".into(), dump, plugin]);
 
-        let exec_result = base::CliExec::new(Arc::new(registry::SecurityContext::default()))
-            .execute(json!({
-                "command": cmd,
-                "timeout_seconds": timeout,
-            }))
-            .await;
+        let exec_result = base::run_fixed(&registry::SecurityContext::default(), &cmd, timeout).await;
 
         let chain_note = json!({
             "custody": {
@@ -104,11 +103,12 @@ impl Tool for YaraScan {
         let target = p.get("target").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("target required"))?;
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(120);
 
-        let cmd = format!("yara -r {} {}", rules, target);
-        base::CliExec::new(Arc::new(registry::SecurityContext::default())).execute(json!({
-            "command": cmd,
-            "timeout_seconds": timeout,
-        })).await
+        let (rules, target) = match (base::safe_value("rules", rules), base::safe_value("target", target)) {
+            (Ok(r), Ok(t)) => (r, t),
+            (Err(e), _) | (_, Err(e)) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let cmd = base::quoted_cmd("yara", &["-r".into(), rules, target]);
+        base::run_fixed(&registry::SecurityContext::default(), &cmd, timeout).await
     }
 }
 
@@ -136,11 +136,15 @@ impl Tool for ZeekParse {
         let filter = get_str(&p, "filter", ".");
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(60);
 
-        let cmd = format!("cat {} | jq -c '{}' | head -500", log, filter);
-        base::CliExec::new(Arc::new(registry::SecurityContext::default())).execute(json!({
-            "command": cmd,
-            "timeout_seconds": timeout,
-        })).await
+        let log = match base::safe_value("log", log) {
+            Ok(l) => l,
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        if let Err(e) = check_jq_filter(&filter) {
+            return Ok(json!({"error": "invalid_params", "message": e.to_string()}));
+        }
+        let cmd = format!("{} | head -500", base::quoted_cmd("jq", &["-c".into(), filter, log]));
+        base::run_fixed(&registry::SecurityContext::default(), &cmd, timeout).await
     }
 }
 
@@ -166,11 +170,14 @@ impl Tool for Osquery {
         let query = p.get("query").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("query required"))?;
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(30);
 
-        let cmd = format!("osqueryi --json \"{}\"", query.replace('"', "\\\""));
-        base::CliExec::new(Arc::new(registry::SecurityContext::default())).execute(json!({
-            "command": cmd,
-            "timeout_seconds": timeout,
-        })).await
+        // Sin comandos meta de osqueryi (`.…`) ni flags: solo una consulta SQL.
+        let query = match base::safe_value("query", query) {
+            Ok(q) if !q.starts_with('.') => q,
+            Ok(_) => return Ok(json!({"error": "invalid_params", "message": "query no puede empezar por '.'"})),
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let cmd = base::quoted_cmd("osqueryi", &["--json".into(), query]);
+        base::run_fixed(&registry::SecurityContext::default(), &cmd, timeout).await
     }
 }
 
@@ -201,26 +208,55 @@ impl Tool for LogParse {
         let limit = p.get("limit").and_then(|v| v.as_u64()).unwrap_or(500);
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(30);
 
+        let file = match base::safe_value("file", file) {
+            Ok(f) => f,
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let limit = limit.clamp(1, 5000).to_string();
+        let sec = registry::SecurityContext::default();
         if regex.is_empty() {
-            let cmd = format!("head -{} '{}'", limit, file);
-            return base::CliExec::new(Arc::new(registry::SecurityContext::default())).execute(json!({
-                "command": cmd,
-                "timeout_seconds": timeout,
-            })).await;
+            let cmd = base::quoted_cmd("head", &["-n".into(), limit, file]);
+            return base::run_fixed(&sec, &cmd, timeout).await;
         }
-
-        let cmd = format!("grep -P '{}' '{}' | head -{}", regex.replace('\'', "'\\''"), file, limit);
-        base::CliExec::new(Arc::new(registry::SecurityContext::default())).execute(json!({
-            "command": cmd,
-            "timeout_seconds": timeout,
-        })).await
+        if regex.chars().any(|c| c.is_control()) {
+            return Ok(json!({"error": "invalid_params", "message": "regex con caracteres de control"}));
+        }
+        // `-e` fija el patrón (aunque empiece por '-') y `--` el fin de opciones.
+        let grep = base::quoted_cmd("grep", &["-P".into(), "-e".into(), regex, "--".into(), file]);
+        let cmd = format!("{} | head -n {}", grep, limit);
+        base::run_fixed(&sec, &cmd, timeout).await
     }
 }
 
+/// Un filtro jq es un programa: puede leer el entorno (claves API) o archivos.
+/// Se rechazan esos accesos; el filtro tampoco puede empezar por `-` (flag).
+fn check_jq_filter(f: &str) -> Result<()> {
+    let t = f.trim();
+    if t.is_empty() || t.starts_with('-') {
+        return Err(anyhow!("filtro jq inválido"));
+    }
+    let l = t.to_lowercase();
+    for bad in ["env", "input", "import", "include", "$__prog", "getpath(\"/"] {
+        if l.contains(bad) {
+            return Err(anyhow!("filtro jq no permitido: contiene '{}'", bad));
+        }
+    }
+    Ok(())
+}
+
 async fn compute_file_hash(path: &str) -> Result<String> {
-    let bytes = tokio::fs::read(path).await?;
+    // Por bloques: un volcado de memoria puede pesar varios GB.
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -232,4 +268,49 @@ pub fn create_all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Osquery),
         Arc::new(LogParse),
     ]
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jq_filter_blocks_env_and_flags() {
+        assert!(check_jq_filter(".").is_ok());
+        assert!(check_jq_filter(".[] | select(.id_orig_h == \"1.2.3.4\")").is_ok());
+        assert!(check_jq_filter("env.ANTHROPIC_API_KEY").is_err());
+        assert!(check_jq_filter("$ENV.PATH").is_err());
+        assert!(check_jq_filter("input").is_err());
+        assert!(check_jq_filter("-n").is_err());
+    }
+
+    #[tokio::test]
+    async fn log_parse_treats_regex_and_path_as_data() {
+        let dir = std::env::temp_dir().join(format!("hc-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.log");
+        std::fs::write(&f, "ok line\nERROR boom\n-e trick\n").unwrap();
+        let t = LogParse;
+        // regex que parece inyección: se busca literal, no se ejecuta
+        let r = t.execute(json!({"file": f.to_str().unwrap(), "regex": "x'; touch /tmp/hc_pwned_flag; echo '"})).await.unwrap();
+        assert_eq!(r["stdout"].as_str().unwrap().trim(), "", "{r}"); // sin coincidencias
+        assert!(!std::path::Path::new("/tmp/hc_pwned_flag").exists());
+        // patrón que empieza por '-' se trata como patrón
+        let r = t.execute(json!({"file": f.to_str().unwrap(), "regex": "-e trick"})).await.unwrap();
+        assert!(r["stdout"].as_str().unwrap().contains("-e trick"), "{r}");
+        // ruta que empieza por '-' se rechaza
+        let r = t.execute(json!({"file": "-rf"})).await.unwrap();
+        assert_eq!(r["error"], "invalid_params");
+    }
+
+    #[tokio::test]
+    async fn hash_streams_and_matches_known_digest() {
+        let dir = std::env::temp_dir().join(format!("hc-hash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.bin");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(
+            compute_file_hash(f.to_str().unwrap()).await.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

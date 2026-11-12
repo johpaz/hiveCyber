@@ -23,7 +23,7 @@ fn get_str(params: &HashMap<String, Value>, key: &str, default: &str) -> String 
 }
 
 macro_rules! cli_wrapper {
-    ($name:ident, $tool_name:expr, $description:expr, $default_cmd:expr) => {
+    ($name:ident, $tool_name:expr, $description:expr, $bin:expr, $target_flag:expr, $deny:expr) => {
         pub struct $name {
             security: Arc<registry::SecurityContext>,
         }
@@ -64,11 +64,21 @@ macro_rules! cli_wrapper {
                     }));
                 }
 
-                let cmd = if flags.is_empty() {
-                    format!("{} {}", $default_cmd, target)
-                } else {
-                    format!("{} {} {}", $default_cmd, flags, target)
+                // Sin interpolación cruda: flags validados + valores citados.
+                let flag_toks = match base::safe_flags(&flags)
+                    .and_then(|f| base::deny_flags($tool_name, &f, $deny).map(|_| f))
+                {
+                    Ok(f) => f,
+                    Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
                 };
+                let target_val = match base::safe_value("target", target) {
+                    Ok(t) => t,
+                    Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+                };
+                let mut argv = flag_toks;
+                argv.push($target_flag.to_string());
+                argv.push(target_val);
+                let cmd = base::quoted_cmd($bin, &argv);
 
                 base::CliExec::new(self.security.clone()).execute(json!({
                     "command": cmd,
@@ -79,9 +89,18 @@ macro_rules! cli_wrapper {
     };
 }
 
-cli_wrapper!(Nuclei, "nuclei", "Escaneo de vulnerabilidades web con nuclei templates.", "nuclei -u");
-cli_wrapper!(Nikto, "nikto", "Scanner web de vulnerabilidades conocido.", "nikto -h");
-cli_wrapper!(Sqlmap, "sqlmap", "Deteccion y explotacion de SQL injection.", "sqlmap -u");
+// Flags que ejecutan código, escriben/leen archivos arbitrarios o abren shells.
+const NUCLEI_DENY: &[&str] = &["-code", "-config", "-headless", "-system-resolvers"];
+const NIKTO_DENY: &[&str] = &["-config"];
+const SQLMAP_DENY: &[&str] = &[
+    "--os-shell", "--os-cmd", "--os-pwn", "--os-smbrelay", "--os-bof", "--priv-esc",
+    "--reg-read", "--reg-add", "--reg-del", "--file-read", "--file-write", "--file-dest",
+    "--sql-shell", "--sql-file", "--eval", "--shell", "--udf-inject", "--shared-lib",
+];
+
+cli_wrapper!(Nuclei, "nuclei", "Escaneo de vulnerabilidades web con nuclei templates.", "nuclei", "-u", NUCLEI_DENY);
+cli_wrapper!(Nikto, "nikto", "Scanner web de vulnerabilidades conocido.", "nikto", "-h", NIKTO_DENY);
+cli_wrapper!(Sqlmap, "sqlmap", "Deteccion y explotacion de SQL injection.", "sqlmap", "-u", SQLMAP_DENY);
 
 pub struct Searchsploit {
     security: Arc<registry::SecurityContext>,
@@ -112,7 +131,14 @@ impl Tool for Searchsploit {
         let p = read_params(&params)?;
         let query = p.get("query").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("query required"))?;
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(60);
-        let cmd = format!("searchsploit {}", query);
+        // Solo palabras sueltas, citadas; ninguna puede ser un flag.
+        let words: Result<Vec<String>> = query.split_whitespace().map(|w| base::safe_value("query", w)).collect();
+        let words = match words {
+            Ok(w) if !w.is_empty() => w,
+            Ok(_) => return Ok(json!({"error": "invalid_params", "message": "query vacío"})),
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let cmd = base::quoted_cmd("searchsploit", &words);
         base::CliExec::new(self.security.clone()).execute(json!({
             "command": cmd,
             "timeout_seconds": timeout,
@@ -151,7 +177,11 @@ impl Tool for Semgrep {
         let path = p.get("path").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("path required"))?;
         let config = get_str(&p, "config", "auto");
         let timeout = p.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(180);
-        let cmd = format!("semgrep scan --config {} {}", config, path);
+        let (config, path) = match (base::safe_value("config", &config), base::safe_value("path", path)) {
+            (Ok(c), Ok(p)) => (c, p),
+            (Err(e), _) | (_, Err(e)) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let cmd = base::quoted_cmd("semgrep", &["scan".into(), "--config".into(), config, path]);
         base::CliExec::new(self.security.clone()).execute(json!({
             "command": cmd,
             "timeout_seconds": timeout,
@@ -195,7 +225,11 @@ impl Tool for Trivy {
             "image" => "image",
             _ => "filesystem",
         };
-        let cmd = format!("trivy {} {}", subcmd, target);
+        let target = match base::safe_value("target", target) {
+            Ok(t) => t,
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let cmd = base::quoted_cmd("trivy", &[subcmd.to_string(), target]);
 
         base::CliExec::new(self.security.clone()).execute(json!({
             "command": cmd,

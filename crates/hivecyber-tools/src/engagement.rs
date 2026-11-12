@@ -1,10 +1,63 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
+/// Reglas del programa sobre el uso de IA. Si el programa no permite envío
+/// autónomo, ningún agente puede enviar reportes por su cuenta.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AiPolicy {
+    /// El informe debe declarar que fue asistido por IA.
+    #[serde(default)]
+    pub disclosure_required: bool,
+    /// Por defecto `false`: un humano siempre revisa y envía.
+    #[serde(default)]
+    pub autonomous_submission_allowed: bool,
+}
+
+impl Default for AiPolicy {
+    fn default() -> Self {
+        AiPolicy {
+            disclosure_required: true,
+            autonomous_submission_allowed: false,
+        }
+    }
+}
+
+/// Configuración del pipeline de hallazgos (ingesta de scope y dedup).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeConfig {
+    #[serde(default)]
+    pub ingest_scope_on_load: bool,
+    #[serde(default = "default_dedup_threshold")]
+    pub dedup_threshold: f64,
+}
+
+fn default_dedup_threshold() -> f64 {
+    0.72
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        KnowledgeConfig {
+            ingest_scope_on_load: false,
+            dedup_threshold: default_dedup_threshold(),
+        }
+    }
+}
+
+// `deny_unknown_fields`: un campo mal escrito o no soportado en la política
+// (p. ej. `prohibted`) debe FALLAR al cargar, no ignorarse en silencio — una
+// restricción descartada es peor que ninguna.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EngagementPolicy {
     #[serde(default)]
     pub program: String,
+    #[serde(default)]
+    pub ai_policy: AiPolicy,
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
     #[serde(default)]
     pub targets: Vec<TargetRule>,
     #[serde(default)]
@@ -18,6 +71,7 @@ pub struct EngagementPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TargetRule {
     pub host: String,
     #[serde(default)]
@@ -53,6 +107,7 @@ pub enum ApprovalCategory {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TimeWindow {
     #[serde(default)]
     pub allowed_days: Vec<String>,
@@ -276,6 +331,13 @@ fn host_matches_rule(norm_host: &str, rule_host: &str) -> bool {
             }
         }
         return false;
+    }
+    // Wildcard `*.example.com`: any strict subdomain, NOT the apex itself.
+    if let Some(base) = rule_host.strip_prefix("*.") {
+        let base = normalize_host(base);
+        return !base.is_empty()
+            && base.parse::<IpAddr>().is_err()
+            && norm_host.ends_with(&format!(".{}", base));
     }
     let rule_norm = normalize_host(rule_host);
     if rule_norm.is_empty() {

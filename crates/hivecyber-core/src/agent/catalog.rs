@@ -203,6 +203,20 @@ pub fn catalog_personas() -> Vec<CatalogPersona> {
     // overlap it (e.g. don't send a port-scan to report_writer).
     for p in personas.iter_mut() {
         p.routing_exclusions = routing_exclusions_for(&p.id);
+        // Recon web moderno (webrecon) y registro de hallazgos por worker.
+        let extra: &[&str] = match p.id.as_str() {
+            "recon_operator" => &["subfinder", "httpx", "katana", "gau", "finding_submit"],
+            "web_pentester" => &["httpx", "katana", "ffuf", "gau", "jsluice", "trufflehog", "finding_submit"],
+            "vuln_scanner" => &["httpx", "trufflehog", "finding_submit"],
+            "threat_intel_analyst" => &["gau", "trufflehog", "finding_submit"],
+            "exploit_operator" => &["finding_submit"],
+            _ => &[],
+        };
+        for t in extra {
+            if !p.tool_allowlist.iter().any(|x| x == t) {
+                p.tool_allowlist.push((*t).to_string());
+            }
+        }
     }
     personas
 }
