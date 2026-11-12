@@ -32,3 +32,9 @@ Thumbs.db
 # Cerebro: memoria de hallazgos y scope derivado por engagement (privados)
 engagements/*/findings/
 engagements/*/knowledge/
+
+# Datos reales de engagements (privados, pueden estar bajo NDA del programa)
+engagements/*/recon/
+engagements/*/mission.txt
+findings/
+reports/

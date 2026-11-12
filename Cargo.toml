@@ -48,5 +48,5 @@ strip = true
 # TEMPORAL: hiveBD v0.5.1 + tantivy 0.22 (evita el choque de zstd-sys con tantivy 0.21).
 # Quitar cuando exista un tag upstream (p. ej. v0.5.2) y apuntar la dependencia a ese tag.
 [patch."https://github.com/johpaz/hiveBD"]
-hivedb-core = { path = "/tmp/claude-1000/-data-hiveCyber-review/2747cf57-af5d-4e1c-9f1b-c27d7080d99b/scratchpad/hiveBD/crates/hivedb-core" }
-hivedb-index = { path = "/tmp/claude-1000/-data-hiveCyber-review/2747cf57-af5d-4e1c-9f1b-c27d7080d99b/scratchpad/hiveBD/crates/hivedb-index" }
+hivedb-core = { path = "/home/johnpaez/Documentos/Agents/Hive/hiveBD/crates/hivedb-core" }
+hivedb-index = { path = "/home/johnpaez/Documentos/Agents/Hive/hiveBD/crates/hivedb-index" }

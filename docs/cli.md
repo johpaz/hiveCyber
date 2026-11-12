@@ -43,6 +43,8 @@ Options:
                                ventanas horarias, rate_limit_rps, aprobacion humana) —
                                si se pasa, prevalece sobre --allowlist-hosts
   --require-policy             Gate obligatorio: rechaza operar sin una EngagementPolicy
+  --no-policy                  Permite operar agentes sin EngagementPolicy (solo laboratorio propio).
+                               Por defecto chat/run/resume/daemon exigen una política.
                                valida (recomendado para bug bounty)
   --allow-cli-exec             Habilita la tool cli_exec (desactivada por defecto,
                                requiere ademas --unsafe-mode)

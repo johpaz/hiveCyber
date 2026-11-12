@@ -141,6 +141,27 @@ Formato mas expresivo que el allowlist plano, cargado con `--engagement-policy <
   corren en el subproceso worker con su propio contexto (un limiter cross-proceso queda como Roadmap).
 - Toda normalizacion de host (scheme, userinfo, puerto, mayusculas, IPv4 numerico/hex) pasa por `normalize_host()` — usado tanto por `EngagementPolicy` como por el allowlist plano legado, para que ambos caminos vean el mismo host normalizado.
 
+## Gate de política en el middleware (`tools/src/policy_gate.rs`)
+
+Antes de ejecutar CUALQUIER tool, `SecurityContext::gate_tool_call` (invocado desde
+`ToolMiddleware::execute`) aplica la `EngagementPolicy`:
+
+1. **`prohibited`**: cada tool se clasifica en actividades. `nmap/nuclei/nikto/sqlmap/httpx/katana/ffuf`
+   (y los mismos binarios dentro de `cli_exec`) cuentan como `automated_scanning`; `hydra/crackmapexec`
+   como `credential_stuffing`.
+2. **`require_human_approval`**: exploit / credential_use / data_access / destructive_test exigen
+   `--approve-human <categoria>`. `trufflehog verify=true` cuenta como `credential_use`.
+3. **HTTP**: toda tool con argumento `url` (incluidas las MCP/browser) y toda URL en `cli_exec`
+   se valida contra host, path y método de la `TargetRule`, ventana horaria y rate limit.
+4. Un rechazo se audita como intento fallido (`blocked by engagement policy: …`).
+
+Notas: sin política (modo allowlist legacy) el gate no actúa; por eso `chat/run/resume/daemon`
+exigen política salvo `--no-policy`. La política rechaza campos desconocidos al cargar y los
+hosts admiten `*.dominio` (subdominios, no el apex). El rate limit se comparte entre procesos
+con un lock de archivo en `$HIVECYBER_HOME/state`, y la cadena de audit usa además un lock de
+archivo y la cabecera `<home>/db/state/audit.head`, ligada a la propia BD (si la vista de la BD va
+por detrás, rechaza escribir; tras reiniciar la BD a propósito, borra ese archivo).
+
 ## ToolMiddleware: auditoria obligatoria (`core/src/tool_runtime/middleware.rs`)
 
 Toda ejecucion de tool pasa por `ToolMiddleware::execute`, sin excepcion:

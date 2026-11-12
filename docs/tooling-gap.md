@@ -1,5 +1,13 @@
 # Análisis de gaps de tooling
 
+> **Estado:** implementadas (módulo `hivecyber-tools/src/webrecon`): `subfinder`, `httpx`,
+> `katana`, `gau`, `ffuf`, `jsluice`, `trufflehog`. Requieren el binario en `PATH` (si falta,
+> la tool responde `binary_not_found`; no están en la imagen Docker). Parámetros estructurados y
+> argv directo (sin shell), scope por política/allowlist, `-rl`/`-rate` derivado del
+> `rate_limit_rps` de la regla. `httpx`/`katana`/`ffuf` cuentan como `automated_scanning`;
+> `trufflehog verify=true` exige aprobación `credential_use`. Pendientes: `dnsx`, `amass`,
+> `feroxbuster`, `arjun`, `gitleaks`, Caido/mitmproxy, `garak`/`promptfoo`, cloud.
+
 hiveCyber ya integra 38 tools base. Para un foco moderno de **bug bounty web/API/IA**, estas
 son las que más faltan, mapeadas al worker que las usaría y a cómo encajan en el `ToolRegistry`
 (categoría + `Isolation`). Todas son OSS conocidas y no destructivas (recon/descubrimiento),

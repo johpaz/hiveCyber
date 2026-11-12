@@ -25,7 +25,7 @@ configurar → definir alcance → operar → auditar. Empieza aquí.
 | EngagementPolicy (`tools/src/engagement.rs`) | 18 | host matching exacto/subdominio/CIDR v4+v6, exclusiones, glob de paths |
 | Worker sandbox (`hivecyber-worker/src/sandbox.rs`) | 8 | seccomp allowlist funcional (arranca y ejecuta), rlimits, namespaces best-effort |
 | Búsqueda BM25 de capacidades (`agent/capability_search.rs` + tool/catalog selector) | 14 | tantivy, tokenizer ES, tool-selector (máx 12/turno) enganchado al loop, routing_exclusions |
-| **Total** (`cargo test --workspace`) | **187** | todos verdes |
+| **Total** (`cargo test --workspace`) | **237** | todos verdes |
 
 ## Caracteristicas
 
@@ -205,12 +205,30 @@ cargo test --workspace
 Controles de *engagement* requeridos antes de operar agentes autónomos contra programas
 reales (Bugcrowd/HackerOne). Estado actual entre corchetes:
 
-- **Auditoría atómica** de la cadena hash. [✅ hecho — `append_audit` bajo lock global; test de concurrencia]
+- **Auditoría atómica** de la cadena hash. [✅ hecho — `append_audit` bajo lock global + **lock de archivo y cabecera `db/state/audit.head` (junto a la BD) entre procesos**; si la vista de la BD va por detrás de la cabecera, rechaza escribir (fail-closed)]
 - **Ventanas horarias** de engagement. [✅ hecho — `EngagementPolicy::is_within_window`, aplicado en `validate_target`]
-- **Rate limiting compartido** por programa y por destino. [✅ hecho — limiter process-global por `programa::host`, fail-closed; aplicado en `validate_target` para tools in-process]
+- **Rate limiting compartido** por programa y por destino. [✅ hecho — limiter process-global por `programa::host` **más lock de archivo entre procesos** (`$HIVECYBER_HOME/state`), fail-closed; las tools sandboxeadas se limitan en el orquestador antes de despachar al worker]
 - **PolicyGate obligatorio**: `--require-policy` **rechaza** operar sin una `EngagementPolicy`
   válida; el gate aplica allowlist/exclusiones/rutas/métodos/ventanas/rate y aprobaciones.
-  [✅ hecho — modo obligatorio disponible]
+  [✅ hecho — **obligatorio por defecto** en `chat/run/resume/daemon`; `--no-policy` es la salida explícita (con aviso)]
+- **PolicyGate único en el middleware** (`tools/src/policy_gate.rs`): antes de ejecutar cualquier tool aplica
+  `prohibited` (p. ej. `automated_scanning` bloquea nmap/nuclei/nikto/httpx/katana/ffuf y escáneres lanzados
+  vía `cli_exec`), `require_human_approval` (`--approve-human <cat>`), y host+path+método de cualquier URL
+  (`web_fetch`, tools MCP/browser con `url`, `curl`/`wget` en `cli_exec`). Redirects de `web_fetch` solo
+  dentro del mismo host. La política rechaza campos desconocidos (`deny_unknown_fields`) y admite `*.dominio`.
+  [✅ hecho]
+- **Contenido no confiable (prompt injection)**: los resultados de tools de red/CLI/MCP llegan al modelo
+  dentro de `<untrusted_content>` y el system prompt fija que son datos, no instrucciones
+  (`agent/untrusted.rs`). La barrera real sigue siendo el gate de política. [✅ hecho]
+- **Pipeline de hallazgos** (`core/src/findings.rs`, tool `finding_submit`, `hivecyber findings
+  list|show|review|report`; el reporte Markdown añade la divulgación de IA si la política la exige): valida scope, deduplica (clave estable + similitud), redacta secretos y **nunca**
+  pasa a `ready`/`submitted` sin revisión humana. [✅ hecho]
+- **Recon web moderno** (`tools/src/webrecon`): subfinder, httpx, katana, gau, ffuf, jsluice, trufflehog;
+  argv directo sin shell, scope y rate de la política. Wrappers clásicos (nmap, nuclei, nikto, sqlmap,
+  semgrep, trivy, searchsploit, dig, whois, theHarvester, recon-ng) y las tools forenses (volatility, yara,
+  zeek_parse, osquery, log_parse) con valores citados y flags validados (antes las forenses/recon pasivas
+  eran rechazadas siempre por `cli_exec`). [✅ hecho — **pendiente**: wrappers de explotación
+  (metasploit/hydra/crackmapexec/mimikatz), que siguen interpolando valores y requieren revisión aparte]
 - **Acceptance por evidencias estructuradas**: modelo tipado `EvidenceItem` (host, vulnerability,
   shell_session, credential, artifact, correlation, report_file, reproduction…); los tools/workers
   pueden emitir evidencia JSON explícita y los verificadores asertan sobre ella; el texto legado se
