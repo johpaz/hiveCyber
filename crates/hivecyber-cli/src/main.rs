@@ -29,6 +29,11 @@ struct Cli {
     #[arg(long, global = true)]
     require_policy: bool,
 
+    /// Permite operar agentes sin EngagementPolicy (laboratorio propio). Por
+    /// defecto chat/run/resume/daemon exigen una política.
+    #[arg(long, global = true)]
+    no_policy: bool,
+
     #[arg(long, global = true)]
     allow_cli_exec: bool,
 
@@ -112,7 +117,38 @@ enum Commands {
         #[command(subcommand)]
         action: AuditCommands,
     },
+    /// Hallazgos registrados por los agentes (revisión humana obligatoria).
+    Findings {
+        #[command(subcommand)]
+        action: FindingsCommands,
+    },
     Version,
+}
+
+#[derive(Subcommand)]
+enum FindingsCommands {
+    /// Lista hallazgos (más recientes primero).
+    List {
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Muestra un hallazgo completo (JSON).
+    Show { id: String },
+    /// Genera el reporte Markdown de un hallazgo (a stdout o a --out). Añade la
+    /// divulgación de IA si la política la exige.
+    Report {
+        id: String,
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Revisión humana: cambia el estado (ready, rejected, duplicate, submitted, accepted, needs_human_review).
+    Review {
+        id: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -268,6 +304,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut config = Config::default();
+    // Home visible para el estado compartido entre procesos (rate limit y audit
+    // bajo `<home>/state`) y para los subprocesos que herede.
+    std::env::set_var("HIVECYBER_HOME", &config.home_dir);
     let db_path = PathBuf::from(&config.home_dir).join("db");
 
     let db = Arc::new(HiveDb::open(&db_path).await?);
@@ -282,10 +321,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Mandatory PolicyGate: for bug-bounty operation, refuse to run any network
     // tooling without a validated EngagementPolicy in place.
-    if cli.require_policy && security.engagement_policy.is_none() {
+    // Por defecto la política es OBLIGATORIA en los comandos que operan agentes
+    // (chat/run/resume/daemon); `--no-policy` es la salida explícita (con aviso).
+    // `--require-policy` se conserva y la exige en cualquier comando.
+    let operational = matches!(
+        cli.command,
+        Commands::Chat { .. } | Commands::Run { .. } | Commands::Resume { .. } | Commands::Daemon
+    );
+    let policy_missing = security.engagement_policy.is_none();
+    if policy_missing && (cli.require_policy || (operational && !cli.no_policy)) {
         anyhow::bail!(
-            "--require-policy: se requiere una EngagementPolicy válida (--engagement-policy <file>) \
-             antes de operar tools de red. Aborta."
+            "se requiere una EngagementPolicy válida (--engagement-policy <file>) antes de operar \
+             agentes. Usa --no-policy solo en un laboratorio propio, sin objetivos de terceros. Aborta."
+        );
+    }
+    if policy_missing && operational && cli.no_policy {
+        eprintln!(
+            "⚠️  --no-policy: operando SIN EngagementPolicy (sin scope, rate limit ni ventana horaria). \
+             No lo uses contra programas de bug bounty."
         );
     }
 
@@ -308,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
             cmd_egress_rules(security.clone(), allow, resolver, resolve_hosts).await
         }
         Commands::Audit { action } => cmd_audit(db.clone(), action).await,
+        Commands::Findings { action } => cmd_findings(db.clone(), security.clone(), action).await,
         Commands::Version => {
             println!("hivecyber {}", hivecyber_core::VERSION);
             Ok(())
@@ -1558,6 +1612,86 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+async fn cmd_findings(
+    db: Arc<HiveDb>,
+    security: Arc<hivecyber_tools::SecurityContext>,
+    action: FindingsCommands,
+) -> anyhow::Result<()> {
+    use hivecyber_core::findings::{human_review, Finding, FindingStatus};
+    use hivecyber_core::store::collections::COL_FINDINGS;
+    match action {
+        FindingsCommands::List { status } => {
+            let want = match status.as_deref() {
+                Some(s) => Some(FindingStatus::parse(s).ok_or_else(|| anyhow::anyhow!("status inválido '{}'", s))?),
+                None => None,
+            };
+            let mut all: Vec<Finding> = db
+                .list(COL_FINDINGS)
+                .await
+                .into_iter()
+                .filter_map(|(_, v)| serde_json::from_value(v).ok())
+                .filter(|f: &Finding| want.map_or(true, |w| f.status == w))
+                .collect();
+            if all.is_empty() {
+                println!("No hay hallazgos.");
+                return Ok(());
+            }
+            all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            println!("{:<38} {:<20} {:<9} {:<18} {}", "ID", "STATUS", "SEV", "VULN", "HOST ENDPOINT");
+            for f in &all {
+                let st = serde_json::to_value(f.status)?;
+                println!(
+                    "{:<38} {:<20} {:<9} {:<18} {} {}",
+                    f.id,
+                    st.as_str().unwrap_or("?"),
+                    f.severity.as_deref().unwrap_or("-"),
+                    f.vulnerability,
+                    f.host,
+                    f.endpoint
+                );
+            }
+            Ok(())
+        }
+        FindingsCommands::Show { id } => {
+            let doc = db
+                .get(COL_FINDINGS, &id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("finding '{}' no existe", id))?;
+            println!("{}", serde_json::to_string_pretty(&doc)?);
+            Ok(())
+        }
+        FindingsCommands::Report { id, out } => {
+            let doc = db
+                .get(COL_FINDINGS, &id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("finding '{}' no existe", id))?;
+            let f: Finding = serde_json::from_value(doc)?;
+            // Sin política cargada se divulga por defecto (lado conservador).
+            let disclose = security
+                .engagement_policy
+                .as_ref()
+                .map(|p| p.ai_policy.disclosure_required)
+                .unwrap_or(true);
+            let md = hivecyber_core::findings::render_report(&f, disclose);
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, &md)?;
+                    println!("Reporte escrito en {}", path);
+                }
+                None => print!("{}", md),
+            }
+            Ok(())
+        }
+        FindingsCommands::Review { id, status, note } => {
+            let to = FindingStatus::parse(&status)
+                .ok_or_else(|| anyhow::anyhow!("status inválido '{}'", status))?;
+            let f = human_review(&db, &id, to, note).await?;
+            println!("Finding {} → {}", f.id, status);
+            Ok(())
+        }
+    }
 }
 
 async fn cmd_audit(db: Arc<HiveDb>, action: AuditCommands) -> anyhow::Result<()> {

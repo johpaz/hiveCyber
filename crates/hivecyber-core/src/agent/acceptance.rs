@@ -283,7 +283,10 @@ fn distinct_tool_runs(items: &[EvidenceItem], allowed: &[&str]) -> usize {
 }
 
 fn v_recon_coverage(items: &[EvidenceItem]) -> bool {
-    let recon = ["nmap", "dig", "whois", "theharvester", "shodan", "web_search", "web_fetch", "recon_ng"];
+    let recon = [
+        "nmap", "dig", "whois", "theharvester", "shodan", "web_search", "web_fetch", "recon_ng",
+        "subfinder", "httpx", "katana", "gau",
+    ];
     let has_host = items.iter().any(|i| matches!(i, EvidenceItem::Host { .. }));
     count_tool_runs(items, &recon) >= 2 && has_host
 }

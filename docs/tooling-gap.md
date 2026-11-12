@@ -1,5 +1,10 @@
 # Análisis de gaps de tooling
 
+> **Módulo `webrecon` (complementario):** aporta `jsluice` y `trufflehog` (argv directo, sin shell;
+> `trufflehog verify=true` exige aprobación `credential_use`). Define también `subfinder`, `httpx`,
+> `katana`, `gau` y `ffuf`, pero esos nombres ya los registra `recon/mod.rs` y **gana esa
+> implementación** (el registro no pisa tools existentes; ver test `webrecon_overlap_tests`).
+
 hiveCyber ya integra 38 tools base. Para un foco moderno de **bug bounty web/API/IA**, estas
 son las que más faltan, mapeadas al worker que las usaría y a cómo encajan en el `ToolRegistry`
 (categoría + `Isolation`). Todas son OSS conocidas y no destructivas (recon/descubrimiento),
@@ -9,8 +14,7 @@ salvo donde se indica.
 > de shell en los flags): `subfinder`, `dnsx`, `httpx`, `katana`, `gau` (categoría `Recon`,
 > `recon_operator`) y `ffuf`, `feroxbuster`, `arjun` (categoría `Web`, `web_pentester`). Los
 > binarios van en una etapa `recon-builder` opcional del `Dockerfile`.
-> Pendientes (otra forma de seguridad — repos o endpoints LLM, no host/scope): `jsluice`,
-> `trufflehog`, `gitleaks`, `garak`, `promptfoo`, Caido/mitmproxy y las de cloud.
+> Pendientes (otra forma de seguridad — repos o endpoints LLM, no host/scope): `gitleaks`, `garak`, `promptfoo`, Caido/mitmproxy y las de cloud.
 
 ## Recon de activos y superficie web
 El `recon_operator` hoy tiene nmap/dig/whois/theHarvester/shodan/recon-ng. nmap no cubre bien

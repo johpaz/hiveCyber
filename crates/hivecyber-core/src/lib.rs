@@ -7,6 +7,7 @@ pub mod tool_runtime;
 pub mod harness;
 pub mod settings;
 pub mod bootstrap;
+pub mod findings;
 
 pub use config::Config;
 pub use store::HiveDb;

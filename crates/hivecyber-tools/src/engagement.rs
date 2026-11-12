@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
+// `deny_unknown_fields`: un campo mal escrito o no soportado en la política
+// (p. ej. `prohibted`) debe FALLAR al cargar, no ignorarse en silencio — una
+// restricción descartada es peor que ninguna.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EngagementPolicy {
     #[serde(default)]
     pub program: String,
@@ -70,6 +74,7 @@ fn default_dedup_threshold() -> f32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TargetRule {
     pub host: String,
     #[serde(default)]
@@ -132,6 +137,7 @@ pub fn approval_categories_for_tool(tool_name: &str) -> Vec<ApprovalCategory> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TimeWindow {
     #[serde(default)]
     pub allowed_days: Vec<String>,
@@ -355,6 +361,13 @@ fn host_matches_rule(norm_host: &str, rule_host: &str) -> bool {
             }
         }
         return false;
+    }
+    // Wildcard `*.example.com`: any strict subdomain, NOT the apex itself.
+    if let Some(base) = rule_host.strip_prefix("*.") {
+        let base = normalize_host(base);
+        return !base.is_empty()
+            && base.parse::<IpAddr>().is_err()
+            && norm_host.ends_with(&format!(".{}", base));
     }
     let rule_norm = normalize_host(rule_host);
     if rule_norm.is_empty() {

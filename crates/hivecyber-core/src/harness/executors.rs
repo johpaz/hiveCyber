@@ -107,6 +107,8 @@ impl JobExecutor for WorkerTaskExecutor {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string();
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(crate::agent::untrusted::SYSTEM_RULE);
         // Surface the skills most relevant to this task (BM25 skill-selector),
         // so the worker gets its playbooks without shipping the whole set.
         let skills_ctx =
@@ -154,6 +156,14 @@ impl JobExecutor for WorkerTaskExecutor {
             &task_security,
             worker_id,
         );
+        // Hallazgos tipados (scope + dedup + redacción; quedan en revisión humana).
+        tool_registry.register(Arc::new(hivecyber_tools::findings::FindingSubmit {
+            db: Arc::new(crate::findings::FindingsBackend {
+                db: self.db.clone(),
+                policy: task_security.engagement_policy.clone(),
+                created_by: worker_id.to_string(),
+            }),
+        }));
         // MCP tools are exposed to workers too; the allowlist below still gates
         // which ones this specific worker may call.
         if let Some(mcp) = self.mcp.as_ref() {
@@ -264,14 +274,10 @@ impl JobExecutor for WorkerTaskExecutor {
                 // worker's context window. Use `char_indices` so we never split
                 // a UTF-8 multibyte sequence (panics otherwise).
                 const MAX_TOOL_RESULT_CHARS: usize = 8000;
-                let result_str = if result_str.len() > MAX_TOOL_RESULT_CHARS {
-                    let cut = result_str
-                        .char_indices()
-                        .take_while(|(i, _)| *i <= MAX_TOOL_RESULT_CHARS)
-                        .last()
-                        .map(|(i, c)| i + c.len_utf8())
-                        .unwrap_or(MAX_TOOL_RESULT_CHARS);
-                    format!("{}…[truncado: {} chars totales]", &result_str[..cut], result_str.len())
+                let result_str = crate::agent::untrusted::truncate_chars(&result_str, MAX_TOOL_RESULT_CHARS);
+                // Contenido del exterior = dato no confiable (anti prompt injection).
+                let result_str = if result.success {
+                    crate::agent::untrusted::wrap(&tool_call.name, &result_str)
                 } else {
                     result_str
                 };

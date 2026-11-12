@@ -62,8 +62,23 @@ impl crate::registry::Tool for Nmap {
             }));
         }
 
+        const NMAP_DENY: &[&str] = &[
+            "-iL", "--excludefile", "--datadir", "--script-args-file", "--resume",
+            "--stylesheet", "--servicedb", "--versiondb", "--interactive",
+        ];
+        let mut argv = match base::safe_flags(&flags)
+            .and_then(|f| base::deny_flags("nmap", &f, NMAP_DENY).map(|_| f))
+        {
+            Ok(f) => f,
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        match base::safe_value("target", target) {
+            Ok(t) => argv.push(t),
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        }
+
         base::CliExec::new(self.security.clone()).execute(json!({
-            "command": format!("nmap {} {}", flags, target),
+            "command": base::quoted_cmd("nmap", &argv),
             "timeout_seconds": timeout,
         })).await
     }
@@ -93,16 +108,22 @@ impl crate::registry::Tool for Dig {
         let record_type = get_str(&p, "record_type", "A");
         let server = p.get("server").and_then(|v| v.as_str()).unwrap_or("");
 
-        let cmd = if server.is_empty() {
-            format!("dig {} {}", domain, record_type)
-        } else {
-            format!("dig @{} {} {}", server, domain, record_type)
+        let (domain, record_type) = match (base::safe_ident("domain", domain), base::safe_ident("record_type", &record_type)) {
+            (Ok(d), Ok(r)) => (d, r),
+            (Err(e), _) | (_, Err(e)) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
         };
+        let mut argv: Vec<String> = Vec::new();
+        if !server.is_empty() {
+            match base::safe_ident("server", server) {
+                Ok(sv) => argv.push(format!("@{}", sv)),
+                Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+            }
+        }
+        argv.push(domain);
+        argv.push(record_type);
 
-        base::CliExec::new(Arc::new(crate::registry::SecurityContext::default())).execute(json!({
-            "command": cmd,
-            "timeout_seconds": 30,
-        })).await
+        // Binario fijo con valores citados: no depende de cli_exec.
+        base::run_fixed(&crate::registry::SecurityContext::default(), &base::quoted_cmd("dig", &argv), 30).await
     }
 }
 
@@ -126,10 +147,11 @@ impl crate::registry::Tool for Whois {
         let p = read_params(&params)?;
         let query = p.get("query").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("query required"))?;
 
-        base::CliExec::new(Arc::new(crate::registry::SecurityContext::default())).execute(json!({
-            "command": format!("whois {}", query),
-            "timeout_seconds": 30,
-        })).await
+        let query = match base::safe_value("query", query) {
+            Ok(q) => q,
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        base::run_fixed(&crate::registry::SecurityContext::default(), &base::quoted_cmd("whois", &[query]), 30).await
     }
 }
 
@@ -155,16 +177,13 @@ impl crate::registry::Tool for TheHarvester {
         let domain = p.get("domain").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("domain required"))?;
         let source = get_str(&p, "source", "all");
 
-        let cmd = if std::path::Path::new("/usr/bin/theHarvester").exists() {
-            format!("theHarvester -d {} -b {}", domain, source)
-        } else {
-            format!("theharvester -d {} -b {}", domain, source)
+        let (domain, source) = match (base::safe_ident("domain", domain), base::safe_ident("source", &source)) {
+            (Ok(d), Ok(sr)) => (d, sr),
+            (Err(e), _) | (_, Err(e)) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
         };
-
-        base::CliExec::new(Arc::new(crate::registry::SecurityContext::default())).execute(json!({
-            "command": cmd,
-            "timeout_seconds": 120,
-        })).await
+        let bin = if std::path::Path::new("/usr/bin/theHarvester").exists() { "theHarvester" } else { "theharvester" };
+        let argv = vec!["-d".to_string(), domain, "-b".to_string(), source];
+        base::run_fixed(&crate::registry::SecurityContext::default(), &base::quoted_cmd(bin, &argv), 120).await
     }
 }
 pub struct Shodan;
@@ -410,18 +429,33 @@ impl crate::registry::Tool for ReconNg {
             return Ok(json!({"error": "security_policy", "message": e, "target": source}));
         }
 
-        // recon-ng is interactive; drive it non-interactively with -m/-o/-x.
-        let mut opts = format!("SOURCE={}", source);
-        for extra in options.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            opts.push(' ');
-            opts.push_str(extra);
+        // recon-ng es interactivo; se maneja con -m/-o/-x. Cada opción va como
+        // `-o KEY=VALUE` independiente (antes se concatenaban en un solo string).
+        let module = match base::safe_ident("module", module) {
+            Ok(m) => m,
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let source = match base::safe_value("source", source) {
+            Ok(sv) => sv,
+            Err(e) => return Ok(json!({"error": "invalid_params", "message": e.to_string()})),
+        };
+        let mut argv: Vec<String> = vec!["-m".into(), module, "-o".into(), format!("SOURCE={}", source)];
+        for extra in options.split(';').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            let Some((k, v)) = extra.split_once('=') else {
+                return Ok(json!({"error": "invalid_params", "message": format!("opción '{}' debe ser KEY=VALUE", extra)}));
+            };
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || v.chars().any(|c| c.is_control()) {
+                return Ok(json!({"error": "invalid_params", "message": format!("opción inválida '{}'", extra)}));
+            }
+            argv.push("-o".into());
+            argv.push(format!("{}={}", k, v));
         }
-        let cmd = format!("recon-ng -m {} -o {} -x", module, opts);
+        // `-x` se conserva tal cual estaba (sintaxis de recon-ng NO verificada:
+        // el binario no estaba disponible al migrar el citado).
+        argv.push("-x".into());
 
-        base::CliExec::new(self.security.clone()).execute(json!({
-            "command": cmd,
-            "timeout_seconds": timeout,
-        })).await
+        base::run_fixed(&self.security, &base::quoted_cmd("recon-ng", &argv), timeout).await
     }
 }
 

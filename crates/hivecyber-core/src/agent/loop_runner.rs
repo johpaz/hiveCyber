@@ -179,6 +179,8 @@ async fn run_loop(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    system_prompt.push_str("\n\n");
+    system_prompt.push_str(crate::agent::untrusted::SYSTEM_RULE);
 
     // Per-session scratch dir: same rationale as the worker_task executor
     // (harness/executors.rs) — gives cli_exec/fs_write/fs_edit/fs_delete a
@@ -238,6 +240,15 @@ async fn run_loop(
         &session_security,
         &opts.agent_id,
     );
+
+    // Hallazgos tipados: scope + dedup + redacción; quedan en revisión humana.
+    tool_registry.register(Arc::new(hivecyber_tools::findings::FindingSubmit {
+        db: Arc::new(crate::findings::FindingsBackend {
+            db: db.clone(),
+            policy: session_security.engagement_policy.clone(),
+            created_by: opts.agent_id.clone(),
+        }),
+    }));
 
     // Expose the connected MCP servers' tools to this agent. Registered after
     // the native + delegation tools so a colliding MCP tool name never shadows
@@ -576,8 +587,10 @@ async fn run_loop(
             // Cap tool results so a single huge MCP response (e.g. a full brief
             // JSON) doesn't dominate the context window and starve the model.
             const MAX_TOOL_RESULT_CHARS: usize = 8000;
-            let result_str = if result_str.len() > MAX_TOOL_RESULT_CHARS {
-                format!("{}…[truncado: {} chars totales]", &result_str[..MAX_TOOL_RESULT_CHARS], result_str.len())
+            let result_str = crate::agent::untrusted::truncate_chars(&result_str, MAX_TOOL_RESULT_CHARS);
+            // Contenido del exterior = dato no confiable (anti prompt injection).
+            let result_str = if result.success {
+                crate::agent::untrusted::wrap(&tool_call.name, &result_str)
             } else {
                 result_str
             };

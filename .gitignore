@@ -46,3 +46,8 @@ scoped-browser.jsonl
 
 # Bitácoras de sesión de Claude Code (contienen tokens/alias)
 2026-*-*.txt
+# Datos reales de engagements (privados, pueden estar bajo NDA del programa)
+engagements/*/recon/
+engagements/*/mission.txt
+findings/
+reports/

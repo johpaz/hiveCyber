@@ -36,6 +36,36 @@ fn rate_limiter() -> &'static std::sync::Mutex<std::collections::HashMap<String,
 }
 
 impl SecurityContext {
+    /// Scope check para recon pasivo/ligero: igual que `validate_target` pero SIN
+    /// exigir `--unsafe-mode` (reservado a tools ofensivas). Con política:
+    /// regla + exclusiones + ventana horaria + rate limit; sin política: allowlist.
+    pub fn check_scope(&self, target: &str) -> Result<(), String> {
+        if let Some(ref policy) = self.engagement_policy {
+            let outcome = policy.target_allowed(target);
+            if outcome.excluded {
+                return Err(format!("target '{}' excluded by engagement policy", target));
+            }
+            if outcome.rule.is_none() {
+                return Err(format!("target '{}' not in engagement policy allowlist", target));
+            }
+            if !policy.is_within_window(chrono::Utc::now()) {
+                return Err(format!(
+                    "fuera de la ventana horaria autorizada del programa '{}'",
+                    policy.program
+                ));
+            }
+            if let Some(rps) = policy.rate_limit_for(target) {
+                self.check_rate_limit(&policy.program, target, rps)?;
+            }
+            return Ok(());
+        }
+        if validate_target_in_allowlist(target, &self.allowlist_hosts) {
+            Ok(())
+        } else {
+            Err(format!("target '{}' not in allowlist — use --allowlist-hosts", target))
+        }
+    }
+
     pub fn validate_target(&self, target: &str) -> Result<(), String> {
         if !self.unsafe_mode {
             return Err(format!(
@@ -175,7 +205,7 @@ impl SecurityContext {
     /// (program, host). Fail-closed: exceeding the rate is rejected rather than
     /// queued, so agents never flood a bug-bounty target. Records the request
     /// time on success.
-    fn check_rate_limit(&self, program: &str, target: &str, rps: f64) -> Result<(), String> {
+    pub(crate) fn check_rate_limit(&self, program: &str, target: &str, rps: f64) -> Result<(), String> {
         if rps <= 0.0 {
             return Ok(());
         }
@@ -193,7 +223,25 @@ impl SecurityContext {
                 ));
             }
         }
-        map.insert(key, now);
+        map.insert(key.clone(), now);
+        drop(map);
+        // Entre procesos (daemon + run, workers): lock de archivo en
+        // `$HIVECYBER_HOME/state`. Fail-closed si no se puede leer/escribir.
+        if let Some(dir) = crate::shared_state::state_dir() {
+            crate::shared_state::file_rate_check(&dir, &key, min_interval)?;
+        }
+        Ok(())
+    }
+
+    /// Rate limit del programa para un destino, aplicado por el ORQUESTADOR
+    /// (usado antes de despachar tools sandboxeadas: en el worker el limitador
+    /// en memoria nace vacío en cada llamada y nunca limitaría).
+    pub fn check_policy_rate(&self, target: &str) -> Result<(), String> {
+        if let Some(ref policy) = self.engagement_policy {
+            if let Some(rps) = policy.rate_limit_for(target) {
+                return self.check_rate_limit(&policy.program, target, rps);
+            }
+        }
         Ok(())
     }
 
@@ -413,6 +461,14 @@ impl ToolRegistry {
             reg.register(tool);
         }
 
+        // `webrecon` solo aporta lo que `recon` no define (jsluice, trufflehog…):
+        // en un choque de nombre gana la implementación ya registrada, para no
+        // pisar en silencio las tools de `recon` (con sus propios tests).
+        for tool in crate::webrecon::create_all(sec.clone()) {
+            if reg.get(tool.name()).is_none() {
+                reg.register(tool);
+            }
+        }
         for tool in crate::vulns::create_all(sec.clone()) {
             reg.register(tool);
         }
@@ -444,5 +500,23 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod webrecon_overlap_tests {
+    use super::*;
+
+    #[test]
+    fn webrecon_does_not_shadow_recon_tools_but_adds_missing_ones() {
+        let reg = ToolRegistry::create_with_security(std::sync::Arc::new(SecurityContext::default()));
+        // Los nombres duplicados siguen siendo los de `recon` (categoría Recon/Web).
+        for n in ["subfinder", "httpx", "katana", "gau"] {
+            let t = reg.get(n).unwrap_or_else(|| panic!("{n} falta"));
+            assert_eq!(t.category(), ToolCategory::Recon, "{n} debe ser el de recon");
+        }
+        // Lo que `recon` no tiene sí llega desde `webrecon`.
+        assert!(reg.get("jsluice").is_some());
+        assert!(reg.get("trufflehog").is_some());
     }
 }

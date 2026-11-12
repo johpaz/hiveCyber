@@ -90,6 +90,18 @@ impl ToolMiddleware {
         let start = Instant::now();
         let target = extract_target(tool_name, &args);
 
+        // Policy gate: prohibited activities, human approval, and HTTP
+        // host/path/method scope are enforced BEFORE any execution. A rejection
+        // is still audited below (attempts are evidence).
+        let mut gate = self.security.gate_tool_call(tool_name, &args);
+        // Tools sandboxeadas corren en un worker nuevo por llamada: su limitador
+        // en memoria nace vacío, así que el rps del programa se aplica AQUÍ.
+        if gate.is_ok() && tool.isolation() == Isolation::Sandbox {
+            if let Some(t) = target.as_deref() {
+                gate = self.security.check_policy_rate(t);
+            }
+        }
+
         // Isolation router: tools declaring Isolation::Sandbox never execute
         // in-process. They are dispatched to the `hivecyber-worker` binary
         // over stdio, where seccomp + rlimits + namespaces confine them.
@@ -114,6 +126,12 @@ impl ToolMiddleware {
                     "blocked_pending_approval: '{}' requires human approval for category '{}'",
                     tool_name, category
                 )),
+            }
+        } else if let Err(reason) = gate {
+            ToolOutcome {
+                success: false,
+                result: serde_json::Value::Null,
+                error: Some(format!("blocked by engagement policy: {}", reason)),
             }
         } else if let Some(reason) = automated_scan_gate(&self.security, tool_name) {
             ToolOutcome { success: false, result: serde_json::Value::Null, error: Some(reason) }
